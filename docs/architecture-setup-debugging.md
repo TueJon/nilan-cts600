@@ -1,22 +1,25 @@
 # Nilan CTS600 Architecture, Setup, Safety Gates, and Debugging
 
 This document is the restart point for humans and agents working on the Nilan
-CTS600 stack. It describes the current live deployment, the repository shape,
+CTS600 stack. It describes a reusable deployment template, the repository shape,
 the safety gates, and the first debugging path without relying on issue-thread
 history.
 
-## Current Deployment
+## Deployment Template
 
-| Area | Current owner/host | Notes |
+| Area | Example value | Notes |
 |---|---|---|
-| Firmware build/USB flashing | `TJ-PC` | Use this host for local ESPHome work when the ESP must be connected by USB. |
-| Live daemon/API/MQTT stack | `VD-FW` | Current running stack lives at `/home/vd/nilan-cts600`. |
-| ESP bridge | `192.168.0.15` / `nilan-bridge.local` | Waveshare ESP32-S3-RS485-CAN on the home WLAN. |
-| ESP raw serial stream | TCP `192.168.0.15:6638` | Raw byte stream from ESPHome `stream_server`; not Modbus-TCP. |
-| ESPHome API | TCP `192.168.0.15:6053` | Used by ESPHome/OTA tooling, with secrets in local ESPHome files only. |
-| ESP web UI | `http://192.168.0.15/` | Basic ESPHome device diagnostics. |
+| Firmware build/USB flashing | `<firmware-host>` | Use a local host for ESPHome work when the ESP must be connected by USB. |
+| Live daemon/API/MQTT stack | `<deployment-host>` | Clone the repository at a local `<repo-dir>` chosen by the operator. |
+| ESP bridge | `<bridge-ip>` / `<bridge-hostname>` | Waveshare ESP32-S3-RS485-CAN on the local IoT network. |
+| ESP raw serial stream | TCP `<bridge-ip>:6638` | Raw byte stream from ESPHome `stream_server`; not Modbus-TCP. |
+| ESPHome API | TCP `<bridge-ip>:6053` | Used by ESPHome/OTA tooling, with secrets in local ESPHome files only. |
+| ESP web UI | `http://<bridge-ip>/` | Basic ESPHome device diagnostics. |
 | Nilan web/API proxy | Retired | `nilan-caddy` / TCP 8643 is profile-gated and must stay stopped; HomeBoard uses the internal API. |
-| Public dashboard | `https://homeboard.jonastuechler.at/` | Cloudflare Tunnel to the authenticated HomeBoard gateway. |
+| Dashboard | `<authenticated-dashboard-url>` | Optional authenticated HomeBoard gateway; keep device control local-first. |
+
+These are documentation placeholders, not current deployment values. Keep live
+hostnames, addresses, and filesystem paths in a private operator runbook.
 
 Do not store live passwords, ESPHome OTA keys, Wi-Fi credentials, MQTT
 passwords, Caddy plaintext passwords, or API bearer tokens in git. The local
@@ -51,7 +54,7 @@ The ESP is deliberately simple:
 ```text
 Nilan CTS600 RS485 bus
   -> ESP32-S3-RS485-CAN raw serial-to-TCP bridge on TCP 6638
-  -> VD-FW nilan-api container
+  -> <deployment-host> nilan-api container
   -> socat creates /dev/ttyNILAN
   -> frodef CTS600 driver speaks the CTS600 protocol
   -> FastAPI REST, dashboard, and MQTT state/command topics
@@ -103,13 +106,13 @@ Rollback is physical and simple: power off the Nilan unit, remove the ESP RS485
 wires, reconnect the original CTS600 panel cable exactly as before, then power
 the Nilan unit back on.
 
-Server-side first real read-only switch on VD-FW:
+Server-side first real read-only switch on `<deployment-host>`:
 
 ```bash
-cd ~/nilan-cts600
+cd <repo-dir>
 sed -i 's/^NILAN_MOCKUP=.*/NILAN_MOCKUP=0/' env/nilan.env
 sed -i 's/^NILAN_READ_ONLY=.*/NILAN_READ_ONLY=1/' env/nilan.env
-sed -i 's/^ESP_IP=.*/ESP_IP=192.168.1.139/' env/nilan.env
+sed -i 's/^ESP_IP=.*/ESP_IP=<bridge-ip>/' env/nilan.env
 sed -i 's/^ESP_PORT=.*/ESP_PORT=6638/' env/nilan.env
 docker compose up -d nilan-api
 docker compose logs -f nilan-api
@@ -118,7 +121,7 @@ docker compose logs -f nilan-api
 Expected before writes are considered:
 
 - `nilan-api` stays healthy.
-- Logs show the `socat` tunnel to `192.168.1.139:6638`.
+- Logs show the `socat` tunnel to `<bridge-ip>:6638`.
 - `GET /api/status` returns `mockup:false` and `read_only:true`.
 - `connected:true` appears after a successful poll.
 - `last_error` is null or does not repeat.
@@ -126,7 +129,7 @@ Expected before writes are considered:
 
 ## Compose and Systemd Operations
 
-Run live stack commands on VD-FW in `/home/vd/nilan-cts600`.
+Run live stack commands on `<deployment-host>` from `<repo-dir>`.
 
 Start or restart the stack:
 
@@ -156,7 +159,7 @@ docker compose logs --tail=200 mosquitto
 docker compose logs -f nilan-api
 ```
 
-Health/API checks from VD-FW:
+Health/API checks from `<deployment-host>`:
 
 ```bash
 curl -fsS http://127.0.0.1:8642/healthz | jq
@@ -176,7 +179,7 @@ docker compose --profile legacy-ui stop caddy
 Rollback to safe software state:
 
 ```bash
-cd ~/nilan-cts600
+cd <repo-dir>
 sed -i 's/^NILAN_READ_ONLY=.*/NILAN_READ_ONLY=1/' env/nilan.env
 docker compose up -d nilan-api
 ```
@@ -184,7 +187,7 @@ docker compose up -d nilan-api
 Rollback to mockup:
 
 ```bash
-cd ~/nilan-cts600
+cd <repo-dir>
 sed -i 's/^NILAN_MOCKUP=.*/NILAN_MOCKUP=1/' env/nilan.env
 sed -i 's/^NILAN_READ_ONLY=.*/NILAN_READ_ONLY=1/' env/nilan.env
 docker compose up -d nilan-api
@@ -268,13 +271,13 @@ test is approved and a local observer can verify the unit.
 
 ### ESP Web UI Unreachable
 
-Symptoms: `http://192.168.1.139/` does not load; ESPHome device appears offline.
+Symptoms: `http://<bridge-ip>/` does not load; ESPHome device appears offline.
 
 Check:
 
 ```bash
-ping -c 3 192.168.1.139
-curl -I --max-time 5 http://192.168.1.139/
+ping -c 3 <bridge-ip>
+curl -I --max-time 5 http://<bridge-ip>/
 ```
 
 Likely causes:
@@ -287,16 +290,16 @@ Next actions:
 
 - Confirm ESP power and LEDs locally.
 - Check router/DHCP lease for `nilan-bridge`.
-- Reflash or update Wi-Fi secrets from `TJ-PC` if the device is no longer on the WLAN.
+- Reflash or update Wi-Fi secrets from `<firmware-host>` if the device is no longer on the WLAN.
 
 ### TCP 6638 Closed
 
-Symptoms: ESP web UI works, but `nc -vz 192.168.1.139 6638` fails or times out.
+Symptoms: ESP web UI works, but `nc -vz <bridge-ip> 6638` fails or times out.
 
 Check:
 
 ```bash
-nc -vz 192.168.1.139 6638
+nc -vz <bridge-ip> 6638
 docker compose logs --tail=100 nilan-api
 ```
 
@@ -309,8 +312,8 @@ Likely causes:
 Next actions:
 
 - Confirm firmware includes `stream_server` on port `6638`.
-- Verify `ESP_IP=192.168.1.139` and `ESP_PORT=6638`.
-- Reflash the ESP from `TJ-PC` if the firmware does not expose the stream.
+- Verify `ESP_IP=<bridge-ip>` and `ESP_PORT=6638`.
+- Reflash the ESP from `<firmware-host>` if the firmware does not expose the stream.
 
 ### TCP Connects but No CTS600 Frames
 

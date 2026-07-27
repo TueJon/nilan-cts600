@@ -17,8 +17,8 @@ alternative) over full Home Assistant:
 - The §8 contract (`/api/*` + `nilan/...` topics) is custom; HA would still need
   a shim to remap its native API/MQTT-discovery topics to it. The wrapper
   implements §8 directly with less total glue.
-- Far lighter on `tj-lt` (OOM-prone: paperclip + wameling + task-inbox already
-  resident). Whole stack is capped well under 0.5 GB vs HA's ~1–2 GB.
+- Far lighter for a deployment host with several other services already
+  resident. Whole stack is capped well under 0.5 GB vs HA's ~1–2 GB.
 - `frodef`'s protocol library (`vendor/nilan_cts600.py`, pinned commit in
   `vendor/FRODEF_COMMIT.txt`) imports cleanly standalone, incl. `CTS600Mockup`.
 
@@ -50,7 +50,7 @@ the socat/broker/proxy layers here are reused as-is.
 ## Bring-up NOW (no hardware — mockup)
 
 ```bash
-cd ~/nilan-cts600
+cd <repo-dir>
 cp env/nilan.env.example env/nilan.env      # NILAN_MOCKUP=1 by default
 # secrets:
 PW=$(openssl rand -hex 12)
@@ -67,7 +67,7 @@ docker compose exec -T nilan-api curl -s http://127.0.0.1:8642/api/status | jq
 When Wattson reports the live/static ESP IP on TUE-16:
 
 ```bash
-cd ~/nilan-cts600
+cd <repo-dir>
 sed -i 's/^NILAN_MOCKUP=.*/NILAN_MOCKUP=0/' env/nilan.env
 sed -i 's/^ESP_IP=.*/ESP_IP=<bridge-ip>/'  env/nilan.env
 docker compose up -d mosquitto nilan-api
