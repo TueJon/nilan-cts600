@@ -10,13 +10,13 @@ history.
 | Area | Current owner/host | Notes |
 |---|---|---|
 | Firmware build/USB flashing | `TJ-PC` | Use this host for local ESPHome work when the ESP must be connected by USB. |
-| Live daemon/API/MQTT stack | `TJ-LT` | Current running stack lives at `~/nilan-cts600`. |
-| ESP bridge | `192.168.1.139` / `nilan-bridge.local` | Waveshare ESP32-S3-RS485-CAN on the home WLAN. |
-| ESP raw serial stream | TCP `192.168.1.139:6638` | Raw byte stream from ESPHome `stream_server`; not Modbus-TCP. |
-| ESPHome API | TCP `192.168.1.139:6053` | Used by ESPHome/OTA tooling, with secrets in local ESPHome files only. |
-| ESP web UI | `http://192.168.1.139/` | Basic ESPHome device diagnostics. |
-| Nilan web/API proxy | `http://tj-lt:8643/` | Caddy basic-auth proxy to the `nilan-api` container. |
-| Public dashboard slot | `https://tj-lt.tail34a5cf.ts.net:8443/` | Tailscale Funnel to local Caddy. Keep writes locked unless exposure is reviewed. |
+| Live daemon/API/MQTT stack | `VD-FW` | Current running stack lives at `/home/vd/nilan-cts600`. |
+| ESP bridge | `192.168.0.15` / `nilan-bridge.local` | Waveshare ESP32-S3-RS485-CAN on the home WLAN. |
+| ESP raw serial stream | TCP `192.168.0.15:6638` | Raw byte stream from ESPHome `stream_server`; not Modbus-TCP. |
+| ESPHome API | TCP `192.168.0.15:6053` | Used by ESPHome/OTA tooling, with secrets in local ESPHome files only. |
+| ESP web UI | `http://192.168.0.15/` | Basic ESPHome device diagnostics. |
+| Nilan web/API proxy | Retired | `nilan-caddy` / TCP 8643 is profile-gated and must stay stopped; HomeBoard uses the internal API. |
+| Public dashboard | `https://homeboard.jonastuechler.at/` | Cloudflare Tunnel to the authenticated HomeBoard gateway. |
 
 Do not store live passwords, ESPHome OTA keys, Wi-Fi credentials, MQTT
 passwords, Caddy plaintext passwords, or API bearer tokens in git. The local
@@ -37,7 +37,7 @@ secret-bearing files are:
 | `app/entrypoint.sh` | Container startup; starts `socat` in real mode and then `uvicorn`. |
 | `app/dashboard.html` | Self-hosted Nilan dashboard served by `GET /`. |
 | `vendor/nilan_cts600.py` | Pinned frodef CTS600 protocol implementation. |
-| `docker-compose.yml` | Live stack definition: `mosquitto`, `nilan-api`, `caddy`. |
+| `docker-compose.yml` | Live core stack: `mosquitto`, `nilan-api`; retired `caddy` is under the explicit `legacy-ui` profile. |
 | `env/nilan.env.example` | Safe template for local runtime config. |
 | `mosquitto/mosquitto.conf` | Authenticated local Mosquitto config. |
 | `caddy/Caddyfile` | Reverse proxy and basic-auth hash for web/API access. |
@@ -51,7 +51,7 @@ The ESP is deliberately simple:
 ```text
 Nilan CTS600 RS485 bus
   -> ESP32-S3-RS485-CAN raw serial-to-TCP bridge on TCP 6638
-  -> TJ-LT nilan-api container
+  -> VD-FW nilan-api container
   -> socat creates /dev/ttyNILAN
   -> frodef CTS600 driver speaks the CTS600 protocol
   -> FastAPI REST, dashboard, and MQTT state/command topics
@@ -103,7 +103,7 @@ Rollback is physical and simple: power off the Nilan unit, remove the ESP RS485
 wires, reconnect the original CTS600 panel cable exactly as before, then power
 the Nilan unit back on.
 
-Server-side first real read-only switch on `TJ-LT`:
+Server-side first real read-only switch on VD-FW:
 
 ```bash
 cd ~/nilan-cts600
@@ -126,12 +126,12 @@ Expected before writes are considered:
 
 ## Compose and Systemd Operations
 
-Run live stack commands on `TJ-LT` in `~/nilan-cts600`.
+Run live stack commands on VD-FW in `/home/vd/nilan-cts600`.
 
 Start or restart the stack:
 
 ```bash
-docker compose up -d
+docker compose up -d mosquitto nilan-api
 ```
 
 Rebuild the API image after editing Python, dashboard, requirements, or Docker
@@ -153,11 +153,10 @@ Read logs:
 ```bash
 docker compose logs --tail=200 nilan-api
 docker compose logs --tail=200 mosquitto
-docker compose logs --tail=200 caddy
 docker compose logs -f nilan-api
 ```
 
-Health/API checks from `TJ-LT`:
+Health/API checks from VD-FW:
 
 ```bash
 curl -fsS http://127.0.0.1:8642/healthz | jq
@@ -165,10 +164,13 @@ curl -fsS http://127.0.0.1:8642/api/status | jq
 curl -fsS http://127.0.0.1:8642/api/meta | jq
 ```
 
-Authenticated proxy check:
+The old authenticated proxy is retired. An emergency local-only rollback must use
+the explicit profile and remains bound to loopback:
 
 ```bash
+docker compose --profile legacy-ui up -d caddy
 curl -fsS -u nilan:'<password-from-local-secret-store>' http://127.0.0.1:8643/api/status | jq
+docker compose --profile legacy-ui stop caddy
 ```
 
 Rollback to safe software state:
@@ -212,7 +214,8 @@ sudo systemctl daemon-reload
 
 ## API Surface
 
-`nilan-api` serves REST on internal port `8642`; Caddy exposes it on `8643`.
+`nilan-api` serves REST on internal port `8642`; HomeBoard consumes that internal
+endpoint. Nothing publishes the API on a host interface in the normal profile.
 
 | Method | Path | Purpose |
 |---|---|---|

@@ -1,6 +1,6 @@
 # Nilan CTS600 server-side stack (TUE-22).
-# local-first: only the Caddy reverse proxy is meant to be LAN/WAN exposed;
-# the API and broker bind to the internal compose network.
+# The API and broker bind to the internal compose network. The old Caddy UI is
+# retired and profile-gated; default `docker compose up` must never publish it.
 #
 # Bring-up now (no hardware): NILAN_MOCKUP=1 in env/nilan.env -> full REST+MQTT
 # contract works against the frodef mockup. Once the ESP bridge is live, set
@@ -45,6 +45,7 @@ services:
   caddy:
     image: caddy:2
     container_name: nilan-caddy
+    profiles: ["legacy-ui"]
     restart: unless-stopped
     mem_limit: 96m
     volumes:
@@ -52,7 +53,7 @@ services:
       - caddy-data:/data
       - caddy-config:/config
     ports:
-      - "8643:8643"   # authenticated REST entrypoint (basic auth via Caddyfile)
+      - "127.0.0.1:8643:8643"   # emergency local rollback only; never public/LAN
     depends_on: [nilan-api]
     networks: [nilan]
 
