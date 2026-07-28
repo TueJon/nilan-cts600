@@ -17,8 +17,8 @@ alternative) over full Home Assistant:
 - The §8 contract (`/api/*` + `nilan/...` topics) is custom; HA would still need
   a shim to remap its native API/MQTT-discovery topics to it. The wrapper
   implements §8 directly with less total glue.
-- Far lighter on `tj-lt` (OOM-prone: paperclip + wameling + task-inbox already
-  resident). Whole stack is capped well under 0.5 GB vs HA's ~1–2 GB.
+- Far lighter for a deployment host with several other services already
+  resident. Whole stack is capped well under 0.5 GB vs HA's ~1–2 GB.
 - `frodef`'s protocol library (`vendor/nilan_cts600.py`, pinned commit in
   `vendor/FRODEF_COMMIT.txt`) imports cleanly standalone, incl. `CTS600Mockup`.
 
@@ -32,7 +32,7 @@ the socat/broker/proxy layers here are reused as-is.
 | `vendor/nilan_cts600.py` | Pinned frodef CTS600 protocol lib (incl. mockup) |
 | `app/nilan_api.py` | FastAPI REST + MQTT wrapper (implements plan §8) |
 | `app/Dockerfile`, `app/entrypoint.sh` | API image; entrypoint runs socat sidecar in real mode |
-| `docker-compose.yml` | `mosquitto` + `nilan-api` + `caddy` (auth proxy) |
+| `docker-compose.yml` | `mosquitto` + `nilan-api`; retired Caddy fallback is profile-gated |
 | `mosquitto/` | broker config + `passwd` (gitignored) |
 | `caddy/Caddyfile` | reverse proxy + basic auth on `:8643` |
 | `env/nilan.env(.example)` | config + secrets (`.env` gitignored) |
@@ -50,7 +50,7 @@ the socat/broker/proxy layers here are reused as-is.
 ## Bring-up NOW (no hardware — mockup)
 
 ```bash
-cd ~/nilan-cts600
+cd <repo-dir>
 cp env/nilan.env.example env/nilan.env      # NILAN_MOCKUP=1 by default
 # secrets:
 PW=$(openssl rand -hex 12)
@@ -58,10 +58,8 @@ docker run --rm -v "$PWD/mosquitto:/m" eclipse-mosquitto:2 mosquitto_passwd -b -
 # mosquitto_passwd writes the file 0600 root; the in-container mosquitto user must read it:
 docker run --rm -v "$PWD/mosquitto:/m" --entrypoint sh eclipse-mosquitto:2 -c 'chmod 0644 /m/passwd'
 sed -i "s/^MQTT_PASS=.*/MQTT_PASS=$PW/" env/nilan.env
-HASH=$(docker run --rm caddy:2 caddy hash-password --plaintext "$PW")
-# put $HASH into caddy/Caddyfile (basic_auth nilan <hash>)
-docker compose up -d --build
-curl -s localhost:8642/api/status | jq      # via api directly (or :8643 w/ basic auth via caddy)
+docker compose up -d --build mosquitto nilan-api
+docker compose exec -T nilan-api curl -s http://127.0.0.1:8642/api/status | jq
 ```
 
 ## Go live (ESP bridge installed)
@@ -69,93 +67,41 @@ curl -s localhost:8642/api/status | jq      # via api directly (or :8643 w/ basi
 When Wattson reports the live/static ESP IP on TUE-16:
 
 ```bash
-cd ~/nilan-cts600
+cd <repo-dir>
 sed -i 's/^NILAN_MOCKUP=.*/NILAN_MOCKUP=0/' env/nilan.env
 sed -i 's/^ESP_IP=.*/ESP_IP=<bridge-ip>/'  env/nilan.env
-docker compose up -d
+docker compose up -d mosquitto nilan-api
 docker compose logs -f nilan-api   # expect socat tunnel + frodef reads T15/display
-curl -s localhost:8642/api/status | jq    # t_room (T15) plausible, fan_level/mode/setpoint present
+docker compose exec -T nilan-api curl -s http://127.0.0.1:8642/api/status | jq
 ```
 
 Then run the §9 control verification (fan 1→2→3, mode, setpoint set+readback) and
 confirm the provisional `NILAN_T_SUPPLY_KEY`/`NILAN_T_EXHAUST_KEY` mapping against
 the unit's register dump (TUE-16 §11).
 
-## Web dashboard (TUE-55 — Phase 1, read-only)
+## Dashboard and legacy Caddy rollback
 
-A self-hosted, mobile-friendly **web UI** served by the same `nilan-api` app, so
-it lives behind the same Caddy basic-auth as the API (local-first, no extra
-service or port).
+HomeBoard is the supported dashboard and control surface. The old Nilan Caddy
+listener on TCP/8643 is retired: it is excluded from default Compose operations,
+binds loopback only even when explicitly enabled, and must not be published through
+Tailscale Funnel, Cloudflare Tunnel, or a host firewall rule.
 
-| What | Where |
-|---|---|
-| **URL (LAN)** | `http://tj-lt:8643/` (or `http://192.168.1.103:8643/`) |
-| **URL (public, Tailscale Funnel)** | `https://tj-lt.tail34a5cf.ts.net:8443/` |
-| **Login** | user `nilan` / password delivered via the TUE-55 Paperclip thread (not stored in git, since the endpoint is public) |
-| **Auto-start** | `docker compose` `restart: unless-stopped` + `tailscale funnel --bg` (persisted) |
-| **Refresh** | auto-polls `/api/status` every `NILAN_POLL_SECONDS` (mobile-aware) |
-
-What it shows (Phase 1):
-
-- Live tiles: Raum-/Zuluft-/Ablufttemperatur, Modus, Lüfterstufe, Solltemperatur, Status.
-- **Alle Sensoren** + **Rohdaten** (the full decoded snapshot — every value the
-  frodef driver scraped; humidity/filter/hours appear here automatically once the
-  live unit is on the bus, no code change needed).
-- **Konfiguration / Einstellungen** ("how it's configured"): mockup/live, read-only
-  flag, poll interval, ESP-bridge target, sensor mapping, MQTT base topic, current
-  mode/setpoint/fan/status.
-- Clear **"Keine Live-Daten / Bridge offline"** banner when the bus is down.
-- **Steuerung** (Phase 2, live): fan stage, mode, and setpoint buttons POST to the
-  API and drive the unit; current state is highlighted; guard-rails (`confirm`) on
-  mode changes and **Off**. Active when `NILAN_READ_ONLY=0`; auto-locks back to
-  read-only display if `NILAN_READ_ONLY=1`.
-- **Aktivitätslog**: openable log panel backed by `/api/activity`, with timestamp,
-  actor/source, action type, target, result, and safety state. REST write attempts
-  blocked by `NILAN_READ_ONLY=1` and MQTT commands ignored in read-only mode are
-  recorded as `blocked`; status polling is summarized and hidden by default.
-
-Endpoints: `GET /` (dashboard), `GET /api/meta` (self-describing
-labels/units/config + control envelope), `GET /api/status` (`raw` + `read_only`),
-`GET /api/activity` (bounded in-memory activity log), and the writes
-`POST /api/fan|mode|temp` (gated by `NILAN_READ_ONLY`).
-
-### Update / operate the dashboard
+The API and its bundled historical dashboard remain available inside the Compose
+network for diagnostics:
 
 ```bash
-cd ~/nilan-cts600
-# after editing app/dashboard.html or app/nilan_api.py:
-docker compose up -d --build nilan-api      # rebuild + restart, ~10s
-
-# change the web password:
-docker run --rm caddy:2 caddy hash-password --plaintext '<new-pass>'
-# paste the hash into caddy/Caddyfile (basic_auth nilan <hash>), then:
-docker compose restart caddy
+docker compose exec -T nilan-api curl -s http://127.0.0.1:8642/api/status | jq
 ```
 
-### Public access — Tailscale Funnel (TUE-55)
-
-The dashboard is published to the public internet on Funnel port **8443**
-(`https://tj-lt.tail34a5cf.ts.net:8443/`), proxying to the local Caddy on
-`127.0.0.1:8643`. Funnel port `443` is already used by another service, so `8443`
-is the dashboard's slot. Manage it with:
+Emergency local-only rollback:
 
 ```bash
-tailscale funnel status                                   # show all funnel mappings
-tailscale funnel --bg --https=8443 http://127.0.0.1:8643  # (re)enable dashboard funnel
-tailscale funnel --https=8443 off                         # take it OFF the public internet
+docker compose --profile legacy-ui up -d caddy
+curl -u nilan:'<password-from-local-secret-store>' http://127.0.0.1:8643/api/status
+docker compose --profile legacy-ui stop caddy
 ```
 
-**Security:** Funnel exposes the endpoint to the *whole internet*; the Caddy
-basic-auth credential is the only gate, so it must stay strong (it is NOT in git).
-Because `/api/*` is same-origin, once **Phase 2** flips `NILAN_READ_ONLY=0` the
-*write* endpoints become publicly reachable behind that one password — reconsider
-exposure then (keep control tailnet-only via `tailscale serve`, or add a second
-factor) before unlocking writes on the public Funnel.
-
-> **Phase 2 (control) is live** (`NILAN_READ_ONLY=0`). Write path verified by
-> controlled self-restoring tests (fan 3→2→3, setpoint 18→19→18, mode cool→auto→cool,
-> each read back, final == baseline). To take the unit read-only again, set
-> `NILAN_READ_ONLY=1` and `docker compose up -d nilan-api`.
+Do not remove the `legacy-ui` profile or the `127.0.0.1` bind when testing rollback.
 
 ## Contract (plan §8)
 

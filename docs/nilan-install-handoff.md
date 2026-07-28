@@ -6,18 +6,22 @@ This is the practical install guide for TUE-16/TUE-20 after the ESP32 bridge was
 
 - ESP board: Waveshare ESP32-S3-RS485-CAN.
 - Firmware: ESPHome raw serial-to-TCP bridge, not Modbus-TCP.
-- ESP address: `192.168.1.139` / `nilan-bridge.local`.
-- ESP web UI: `http://192.168.1.139/`.
-- Raw bridge TCP: `192.168.1.139:6638`.
-- Server brain: current live stack is on TJ-LT at `~/nilan-cts600`.
-- Server safety: `NILAN_READ_ONLY=1` is enabled, so REST writes return `403` and MQTT command topics are ignored during first live bringup.
-- Current live stack is still mock mode: `NILAN_MOCKUP=1`. Switch to real mode only after RS485 wiring is done.
+- ESP address: `<bridge-ip>` / `<bridge-hostname>`.
+- ESP web UI: `http://<bridge-ip>/`.
+- Raw bridge TCP: `<bridge-ip>:6638`.
+- Server brain: run the stack on `<deployment-host>` from `<repo-dir>`.
+
+These are documentation placeholders. Keep current hostnames, addresses, and
+filesystem paths in a private operator runbook.
+- Server safety: keep `NILAN_READ_ONLY=1`, so REST writes return `403` and MQTT command topics are ignored during first live bringup.
+- Start in mock mode with `NILAN_MOCKUP=1`. Switch to real mode only after RS485 wiring is done.
 
 ## 2026-06-19 — Live bringup diagnosis (Wattson)
 
-On-site wiring done by Jonas; test driven remotely from TJ-LT (same WLAN).
+On-site wiring done by the operator; test driven from `<deployment-host>` on the
+same local network.
 
-- **Verified working:** ESP online at `192.168.1.139:6638`; the CTS600 **answers** on the
+- **Verified working:** ESP online at `<bridge-ip>:6638`; the CTS600 **answers** on the
   bus (consistent 31-byte reply to `REPORT_SLAVE_ID`, for node 3 and 30). Wiring/power/
   panel-replacement all correct.
 - **Bug found:** firmware UART was `parity: EVEN, stop_bits: 1` (**8E1**). The CTS600 +
@@ -25,17 +29,17 @@ On-site wiring done by Jonas; test driven remotely from TJ-LT (same WLAN).
   reply fails (bytes mangled by EVEN-parity handling) → driver aborts on
   `unknown function code 0x44`.
 - **Fix applied** in `firmware/nilan-bridge.yaml`: `parity: NONE`, `stop_bits: 2`.
-  **Needs one reflash** (OTA from TJ-LT once `firmware/secrets.yaml` is present, or USB on-site).
-- **Still to fix after a good read:** `/etc/nilan/socat.env` has `ESP_BRIDGE_HOST` placeholder
-  **and** port `502` (must be `192.168.1.139:6638`). Confirm node address (env says 30,
+  **Needs one reflash** (OTA from `<firmware-host>` once `firmware/secrets.yaml` is present, or USB on-site).
+- **Still to fix after a good read:** `<host-socat-env>` has an `ESP_BRIDGE_HOST` placeholder
+  **and** port `502` (must be `<bridge-ip>:6638`). Confirm node address (env says 30,
   frodef default is 3).
 
 ## Reference links
 
-- Paperclip parent issue: `https://tj-lt.tail34a5cf.ts.net/TUE/issues/TUE-16`
-- Paperclip implementation issue: `https://tj-lt.tail34a5cf.ts.net/TUE/issues/TUE-20`
-- Paperclip server issue: `https://tj-lt.tail34a5cf.ts.net/TUE/issues/TUE-22`
-- ESP web UI: `http://192.168.1.139/`
+- Paperclip parent issue: `TUE-16` (private tracker)
+- Paperclip implementation issue: `TUE-20` (private tracker)
+- Paperclip server issue: `TUE-22` (private tracker)
+- ESP web UI: `http://<bridge-ip>/`
 - Waveshare board docs: `https://www.waveshare.net/wiki/ESP32-S3-RS485-CAN`
 - ESPHome stream server component: `https://github.com/oxan/esphome-stream-server`
 - frodef CTS600 driver/integration: `https://github.com/frodef/nilan-cts600-homeassistant`
@@ -66,7 +70,7 @@ Bring:
 
 Before touching wires:
 
-1. Open `http://192.168.1.139/` on the same network and confirm the ESP UI loads.
+1. Open `http://<bridge-ip>/` on the same network and confirm the ESP UI loads.
 2. Take a photo of the Nilan panel/connector before disconnecting anything.
 3. Send/post the photo to TUE-16 if anything differs from `12V / A / /B / GND`.
 
@@ -111,13 +115,13 @@ If reads fail later, possible fixes are swapping `A`/`B`, adding shared `GND`, o
 Ask an agent:
 
 ```text
-TUE-16 Nilan is wired and powered. On TJ-LT, switch ~/nilan-cts600 from NILAN_MOCKUP=1 to NILAN_MOCKUP=0, keep NILAN_READ_ONLY=1, keep ESP_IP=192.168.1.139 and ESP_PORT=6638. Recreate nilan-api, watch logs, and verify only read-only /api/status + MQTT state. Do not send write commands.
+TUE-16 Nilan is wired and powered. On <deployment-host>, switch <repo-dir> from NILAN_MOCKUP=1 to NILAN_MOCKUP=0, keep NILAN_READ_ONLY=1, set ESP_IP=<bridge-ip> and ESP_PORT=6638. Recreate nilan-api, watch logs, and verify only read-only /api/status + MQTT state. Do not send write commands.
 ```
 
-Expected agent commands on TJ-LT:
+Expected agent commands on `<deployment-host>`:
 
 ```bash
-cd ~/nilan-cts600
+cd <repo-dir>
 sed -i 's/^NILAN_MOCKUP=.*/NILAN_MOCKUP=0/' env/nilan.env
 grep -E '^(NILAN_MOCKUP|NILAN_READ_ONLY|ESP_IP|ESP_PORT)=' env/nilan.env
 docker compose up -d nilan-api
@@ -127,7 +131,7 @@ docker compose logs -f nilan-api
 Acceptance criteria:
 
 - `nilan-api` remains healthy.
-- Socat connects to `192.168.1.139:6638`.
+- Socat connects to `<bridge-ip>:6638`.
 - `/api/status` returns `mockup:false`.
 - `connected:true` after a successful poll.
 - `last_error:null` or no recurring protocol error.
@@ -177,20 +181,20 @@ After each phase, post a TUE-16 comment with:
 - MQTT result summary.
 - Any errors and exact next action.
 
-## Current known endpoints
+## Endpoint verification template
 
-From TJ-PC:
+From `<firmware-host>`:
 
 ```bash
-curl -I http://192.168.1.139/
-nc -vz 192.168.1.139 6638
+curl -I http://<bridge-ip>/
+nc -vz <bridge-ip> 6638
 ```
 
-From TJ-LT:
+From `<deployment-host>`:
 
 ```bash
-nc -vz 192.168.1.139 6638
-cd ~/nilan-cts600
+nc -vz <bridge-ip> 6638
+cd <repo-dir>
 docker compose ps
 docker exec nilan-api python - <<'PY'
 import urllib.request
