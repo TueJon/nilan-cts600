@@ -12,8 +12,9 @@ Implements the API/MQTT contract from TUE-16 plan section 8:
   POST /api/fan    <- { "level": 0-4 }          (0 = off)
   POST /api/mode   <- { "mode": "auto|heat|cool|off" }
   POST /api/temp   <- { "setpoint": 5-30 }
+  POST /api/room   <- { "celsius": 5-35, "source": "..." }  (live room temperature)
 
-  MQTT subscribe: nilan/fan/set, nilan/mode/set, nilan/temp/set
+  MQTT subscribe: nilan/fan/set, nilan/mode/set, nilan/temp/set, nilan/room/set
   MQTT publish  : nilan/state  (retained JSON, same shape as /api/status)
                   nilan/availability ("online"/"offline", retained LWT)
 
@@ -41,12 +42,14 @@ from typing import Any, Optional
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Query
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
 # frodef protocol library (vendored under ../vendor, added to sys.path by entrypoint)
-from nilan_cts600 import CTS600, CTS600Mockup, NilanCTS600Exception  # type: ignore
+from nilan_cts600 import (  # type: ignore
+    CTS600, CTS600Mockup, NilanCTS600Exception, nilanADToCelsius, nilanCelsiusToAD,
+)
 
 logging.basicConfig(level=os.environ.get("NILAN_LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -58,6 +61,12 @@ PORT_DEV = os.environ.get("NILAN_PORT", "/dev/ttyNILAN")
 RETRIES = int(os.environ.get("NILAN_RETRIES", "3"))
 POLL_SECONDS = float(os.environ.get("NILAN_POLL_SECONDS", "30"))
 T15_FALLBACK = float(os.environ.get("NILAN_T15_FALLBACK", "21"))
+# Live room temperature (POST /api/room, MQTT <base>/room/set). A live value is used
+# for at most ROOM_TTL_SECONDS after it was received; then the daemon falls back to
+# T15_FALLBACK. 0 disables live values entirely (always fallback).
+ROOM_TTL_SECONDS = float(os.environ.get("NILAN_ROOM_TTL_SECONDS", "900"))
+ROOM_MIN_C = 5.0
+ROOM_MAX_C = 35.0
 API_TOKEN = os.environ.get("NILAN_API_TOKEN", "").strip()  # optional bearer for direct access
 READ_ONLY = os.environ.get("NILAN_READ_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
 ACTIVITY_LOG_MAX = int(os.environ.get("NILAN_ACTIVITY_LOG_MAX", "300"))
@@ -67,12 +76,28 @@ HTTP_HOST = os.environ.get("NILAN_HTTP_HOST", "0.0.0.0")
 HTTP_PORT = int(os.environ.get("NILAN_HTTP_PORT", "8642"))
 ESP_IP = os.environ.get("ESP_IP", "").strip()       # live ESP bridge IP (real mode)
 ESP_PORT = os.environ.get("ESP_PORT", "6638").strip()
+
+# Liveness watchdog (TUE-307). The container healthcheck only proves the HTTP
+# server is up; it stays green while the device is `connected:false` and the
+# ventilation.* values go stale (e.g. the long-lived single-client ESP raw-TCP
+# tunnel wedges — ARP flux/WiFi flap — and the in-process socat reconnect can't
+# recover). This watchdog detects a *sustained* disconnect and exits the process
+# so Docker's `restart: unless-stopped` re-runs entrypoint.sh for a fresh socat
+# tunnel — the proven recovery (TUE-307: `docker compose restart nilan-api`).
+# The threshold ensures brief ESP flaps never trigger a restart loop.
+WATCHDOG_ENABLED = os.environ.get("NILAN_WATCHDOG_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+WATCHDOG_THRESHOLD_SECONDS = float(os.environ.get("NILAN_WATCHDOG_THRESHOLD_SECONDS", "180"))
+WATCHDOG_CHECK_SECONDS = float(os.environ.get("NILAN_WATCHDOG_CHECK_SECONDS", "15"))
+WATCHDOG_STARTUP_GRACE_SECONDS = float(os.environ.get("NILAN_WATCHDOG_STARTUP_GRACE_SECONDS", "90"))
 # Panel language to set at connect so frodef's English SHOW-DATA menu regexes
 # match (temperatures). Empty string disables. Default ENGLISH.
 SET_LANGUAGE = os.environ.get("NILAN_SET_LANGUAGE", "ENGLISH").strip()
 
 APP_VERSION = "1.2"  # 1.2 adds activity log (TUE-78)
 DASHBOARD_HTML = (Path(__file__).resolve().parent / "dashboard.html")
+MANIFEST_FILE = (Path(__file__).resolve().parent / "manifest.webmanifest")
+SERVICE_WORKER_FILE = (Path(__file__).resolve().parent / "sw.js")
+ICON_DIR = (Path(__file__).resolve().parent / "icons")
 
 MQTT_HOST = os.environ.get("MQTT_HOST", "").strip()  # empty -> MQTT disabled
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
@@ -250,6 +275,10 @@ class NilanDevice:
         self._cts: Optional[CTS600] = None
         self._stop = threading.Event()
         self._on_state_change = None  # callback(dict) -> None, set by MQTT layer
+        # Room temperature fed to the unit as T15. `_room_live` is None while the
+        # fallback is in use, else (celsius, source, received_monotonic).
+        self._clock = time.monotonic
+        self._room_live: Optional[tuple[float, str, float]] = None
 
     def set_state_callback(self, cb) -> None:
         self._on_state_change = cb
@@ -257,6 +286,16 @@ class NilanDevice:
     # -- lifecycle --
     def connect(self) -> None:
         with self._lock:
+            # Ensure we don't keep a stale serial client/file-descriptor open
+            # when reconnecting through a wedged /dev/ttyNILAN path.
+            if self._cts is not None:
+                try:
+                    client = getattr(self._cts, "client", None)
+                    if client is not None:
+                        client.close()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Failed closing previous CTS600 client before reconnect: %s", e)
+            self._connected = False
             cls = CTS600Mockup if MOCKUP else CTS600
             log.info("Connecting CTS600 (%s, port=%s)", cls.__name__, "mockup" if MOCKUP else PORT_DEV)
             self._cts = cls(port=None if MOCKUP else PORT_DEV)
@@ -274,12 +313,17 @@ class NilanDevice:
                 except Exception as e:  # noqa: BLE001
                     log.warning("setLanguage(%s) failed (non-fatal): %s", SET_LANGUAGE, e)
             if READ_ONLY:
-                log.info("Skipping setT15 fallback because NILAN_READ_ONLY is enabled")
+                log.info("Skipping setT15 injection because NILAN_READ_ONLY is enabled")
             else:
+                # a fresh connection starts from the fallback; re-apply a live
+                # room value that is still within its TTL.
+                live = self._live_room_if_fresh()
                 try:
-                    self._cts.setT15(T15_FALLBACK)
+                    self._cts.setT15(live[0] if live else T15_FALLBACK)
+                    if live:
+                        log.info("Re-applied live room temperature %.2f C after reconnect", live[0])
                 except Exception as e:  # noqa: BLE001
-                    log.warning("setT15 fallback failed (non-fatal): %s", e)
+                    log.warning("setT15 injection failed (non-fatal): %s", e)
             self._connected = True
             self._last_error = None
 
@@ -304,13 +348,19 @@ class NilanDevice:
         # poll
         while not self._stop.is_set():
             try:
+                self.room_watchdog_tick()
                 self.refresh()
                 activity_log.record_status_poll("device-poller", "ok")
             except OSError as e:
                 self._connected = False
                 self._last_error = str(e)
                 activity_log.record_status_poll("device-poller", "error", str(e))
-                log.warning("Poll I/O error (%s) -> reconnecting before next poll", e)
+                log.warning("Poll I/O error (%s) -> waiting for PTY, then reconnecting", e)
+                if not MOCKUP:
+                    for _ in range(20):
+                        if os.path.exists(PORT_DEV):
+                            break
+                        self._stop.wait(0.5)
                 try:
                     self.connect()
                 except Exception as ce:  # noqa: BLE001
@@ -410,6 +460,78 @@ class NilanDevice:
             self._retry("setThermostat", setpoint)
         self.refresh()
 
+    # -- live room temperature --
+    @staticmethod
+    def _snap_room(celsius: float) -> float:
+        """Round to what the unit can represent (AD-converter resolution)."""
+        return round(nilanADToCelsius(nilanCelsiusToAD(celsius)), 2)
+
+    def _live_room_if_fresh(self) -> Optional[tuple[float, str, float]]:
+        live = self._room_live
+        if live is None or ROOM_TTL_SECONDS <= 0:
+            return None
+        return live if self._clock() - live[2] <= ROOM_TTL_SECONDS else None
+
+    def _mock_t15(self, celsius: float) -> None:
+        # the mockup scrapes a static T15; reflect what was injected instead
+        if MOCKUP:
+            self._snapshot = {**self._snapshot, T_ROOM_KEY: celsius}
+
+    def set_room(self, celsius: float, source: str) -> float:
+        """Inject a live room temperature as T15. Returns the value the unit uses."""
+        applied = self._snap_room(celsius)
+        with self._lock:
+            self._retry("setT15", applied)
+            self._room_live = (applied, source, self._clock())
+            self._mock_t15(applied)
+        self._notify_state()
+        return applied
+
+    def room_watchdog_tick(self) -> bool:
+        """Fall back to T15_FALLBACK when the live value is older than the TTL.
+
+        Returns True if a fallback was applied. Logged once per expiry.
+        """
+        with self._lock:
+            live = self._room_live
+            if live is None:
+                return False
+            if ROOM_TTL_SECONDS > 0 and self._clock() - live[2] <= ROOM_TTL_SECONDS:
+                return False
+            age = self._clock() - live[2]
+            if not READ_ONLY and self._cts is not None:
+                self._retry("setT15", T15_FALLBACK)
+            self._room_live = None
+            self._mock_t15(T15_FALLBACK)
+        log.warning("Live room temperature expired (age %.0fs > TTL %.0fs) -> fallback %.1f C",
+                    age, ROOM_TTL_SECONDS, T15_FALLBACK)
+        activity_log.record(
+            source="watchdog",
+            action_type="room_ttl",
+            target="room",
+            result="ok",
+            detail=f"live value from {live[1]} expired after {age:.0f}s; fallback {T15_FALLBACK}",
+            value=_safe_activity_value({"celsius": T15_FALLBACK}),
+        )
+        self._notify_state()
+        return True
+
+    def room_source(self) -> dict[str, Any]:
+        live = self._room_live
+        if live is None:
+            return {"mode": "fallback", "value": T15_FALLBACK, "fallback": T15_FALLBACK,
+                    "age_s": None, "source": None, "ttl_s": ROOM_TTL_SECONDS}
+        return {"mode": "live", "value": live[0], "fallback": T15_FALLBACK,
+                "age_s": round(self._clock() - live[2], 1), "source": live[1],
+                "ttl_s": ROOM_TTL_SECONDS}
+
+    def _notify_state(self) -> None:
+        if self._on_state_change:
+            try:
+                self._on_state_change(self.status())
+            except Exception as e:  # noqa: BLE001
+                log.warning("state callback failed: %s", e)
+
     # -- contract projection (plan section 8) --
     def status(self) -> dict[str, Any]:
         d = self._snapshot
@@ -426,6 +548,7 @@ class NilanDevice:
 
         return {
             "t_room": num(T_ROOM_KEY),
+            "room_source": self.room_source(),
             "t_supply": num(T_SUPPLY_KEY),
             "t_exhaust": num(T_EXHAUST_KEY),
             "fan_level": d.get("flow"),
@@ -476,7 +599,7 @@ class MqttLayer:
     def _on_connect(self, client, userdata, flags, rc, *a):
         log.info("MQTT connected rc=%s", rc)
         client.publish(f"{MQTT_BASE}/availability", "online", qos=1, retain=True)
-        for sub in ("fan/set", "mode/set", "temp/set"):
+        for sub in ("fan/set", "mode/set", "temp/set", "room/set"):
             client.subscribe(f"{MQTT_BASE}/{sub}", qos=1)
         self.publish_state(self.dev.status())
 
@@ -506,6 +629,19 @@ class MqttLayer:
             elif topic.endswith("/temp/set"):
                 value = _coerce_setpoint(payload)
                 self.dev.set_temp(value)
+            elif topic.endswith("/room/set"):
+                try:
+                    value = _coerce_room(payload)
+                    if ROOM_TTL_SECONDS <= 0:
+                        raise ValueError("live room feed disabled (NILAN_ROOM_TTL_SECONDS=0)")
+                except ValueError as e:
+                    activity_log.record(
+                        source="mqtt", action_type="command", target=target,
+                        result="blocked", detail=str(e), value=_safe_activity_value(payload),
+                    )
+                    log.warning("Ignoring MQTT room value %r: %s", payload, e)
+                    return
+                self.dev.set_room(value, "mqtt")
             else:
                 value = payload
             activity_log.record(
@@ -533,6 +669,92 @@ class MqttLayer:
 
 
 mqtt_layer = MqttLayer(device)
+
+
+class LivenessWatchdog:
+    """Restart the process when the device stays `connected:false` too long (TUE-307).
+
+    The poll loop already self-heals transient bus errors by reconnecting
+    in-process. But a wedged ESP raw-TCP tunnel (the single long-lived client
+    drops and the in-container socat reconnect can't recover) leaves the device
+    stuck disconnected while the HTTP healthcheck stays green and ventilation.*
+    serves stale cached reads. The only proven recovery is a full container
+    restart (fresh socat from entrypoint.sh), so on a *sustained* disconnect we
+    exit the process and let Docker's `restart: unless-stopped` do exactly that.
+
+    Anti-flap: a disconnect must persist continuously for THRESHOLD seconds; any
+    successful reconnect resets the timer, so brief ESP flaps never restart the
+    container. A startup grace gives the initial connect time before the clock
+    starts (and prevents a tight restart loop while the ESP is unreachable).
+    """
+
+    def __init__(self, dev: NilanDevice) -> None:
+        self._dev = dev
+        self._stop = threading.Event()
+        self._started_ts = 0.0
+        self._disconnected_since: Optional[float] = None  # None while connected
+
+    def start(self) -> None:
+        if not WATCHDOG_ENABLED or MOCKUP:
+            log.info("Liveness watchdog disabled (enabled=%s, mockup=%s)", WATCHDOG_ENABLED, MOCKUP)
+            return
+        self._started_ts = time.time()
+        t = threading.Thread(target=self._loop, name="nilan-watchdog", daemon=True)
+        t.start()
+        log.info("Liveness watchdog active: restart after connected:false for >%.0fs "
+                 "(check=%.0fs, startup_grace=%.0fs)",
+                 WATCHDOG_THRESHOLD_SECONDS, WATCHDOG_CHECK_SECONDS, WATCHDOG_STARTUP_GRACE_SECONDS)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def status(self) -> dict[str, Any]:
+        ds = self._disconnected_since
+        return {
+            "enabled": bool(WATCHDOG_ENABLED and not MOCKUP),
+            "threshold_seconds": WATCHDOG_THRESHOLD_SECONDS,
+            "disconnected_for_seconds": round(time.time() - ds, 1) if ds else 0.0,
+        }
+
+    def _loop(self) -> None:
+        while not self._stop.wait(WATCHDOG_CHECK_SECONDS):
+            now = time.time()
+            if self._dev._connected:
+                self._disconnected_since = None
+                continue
+            # disconnected — hold off until the startup grace has elapsed so the
+            # initial connect (and a fresh post-restart socat) gets a fair chance.
+            if now - self._started_ts < WATCHDOG_STARTUP_GRACE_SECONDS:
+                continue
+            if self._disconnected_since is None:
+                self._disconnected_since = now
+                log.warning("Watchdog: device connected:false; arming %.0fs restart timer (last_error=%s)",
+                            WATCHDOG_THRESHOLD_SECONDS, self._dev._last_error)
+                continue
+            elapsed = now - self._disconnected_since
+            if elapsed >= WATCHDOG_THRESHOLD_SECONDS:
+                self._trigger_restart(elapsed)
+
+    def _trigger_restart(self, elapsed: float) -> None:
+        log.error("Watchdog: device connected:false for %.0fs (>%.0fs threshold) — "
+                  "exiting for container restart (fresh socat tunnel). last_error=%s",
+                  elapsed, WATCHDOG_THRESHOLD_SECONDS, self._dev._last_error)
+        try:
+            activity_log.record_status_poll(
+                "watchdog", "error",
+                f"sustained disconnect {elapsed:.0f}s -> container restart")
+        except Exception:  # noqa: BLE001
+            pass
+        # flush stdio so the reason survives the abrupt exit, then hard-exit.
+        # os._exit avoids being swallowed by any handler; non-zero so Docker's
+        # restart policy (unless-stopped) recreates the container.
+        import sys
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
+
+
+watchdog = LivenessWatchdog(device)
 
 
 def _coerce_level(payload: str) -> int:
@@ -571,12 +793,21 @@ def _coerce_setpoint(payload: str) -> int:
     return sp
 
 
+def _coerce_room(payload: str) -> float:
+    v = float(payload)
+    if not ROOM_MIN_C <= v <= ROOM_MAX_C:  # also rejects nan/inf
+        raise ValueError(f"room temperature out of range {ROOM_MIN_C:g}-{ROOM_MAX_C:g}")
+    return v
+
+
 # ---- FastAPI ----------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     device.start()
     mqtt_layer.start()
+    watchdog.start()
     yield
+    watchdog.stop()
     device.stop()
 
 
@@ -602,9 +833,15 @@ class TempBody(BaseModel):
     setpoint: int = Field(ge=5, le=30)
 
 
+class RoomBody(BaseModel):
+    celsius: float = Field(ge=ROOM_MIN_C, le=ROOM_MAX_C, allow_inf_nan=False)
+    source: str = Field(default="api", min_length=1, max_length=40)
+
+
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "connected": device._connected, "mockup": MOCKUP, "read_only": READ_ONLY}
+    return {"ok": True, "connected": device._connected, "mockup": MOCKUP,
+            "read_only": READ_ONLY, "watchdog": watchdog.status()}
 
 
 @app.get("/api/meta")
@@ -673,9 +910,12 @@ def get_meta(_: None = Depends(auth)):
             "T5": "Kondensatortemperatur der Wärmepumpe.",
             "T6": "Verdampfertemperatur der Wärmepumpe.",
             "T15": "Fühler im CTS600-Bedienpanel. Das Panel ist durch den ESP ersetzt, "
-                   "daher wird dieser Raumwert vom Daemon injiziert (Fallback) — KEIN echter "
-                   "Live-Raumfühler. Für echte Raumtemperatur einen externen Fühler einspeisen.",
-            "t_room": "Raumtemperatur, die das Gerät zur Regelung nutzt (= T15, aktuell injizierter Fallback).",
+                   "daher injiziert der Daemon diesen Raumwert: live aus einem externen Fühler "
+                   "(POST /api/room, MQTT room/set; verfällt nach dem TTL) oder, ohne frischen "
+                   "Messwert, als fester Fallback — dann KEIN echter Raumfühler.",
+            "t_room": "Raumtemperatur, die das Gerät zur Regelung nutzt (= T15). Modus live: zuletzt "
+                      "per POST /api/room bzw. MQTT room/set gemeldeter Messwert (gilt nur bis zum TTL); "
+                      "Modus fallback: fester Ersatzwert des Daemons. Siehe room_source im Status.",
             "t_supply": "Zulufttemperatur (T2) — Luft, die in die Wohnung geblasen wird.",
             "t_exhaust": "Frischluft/Außen (T1) — angesaugte Außenluft.",
             "setpoint": "Solltemperatur (Thermostat), 5–30 °C — gewünschte Raumtemperatur.",
@@ -713,6 +953,39 @@ def dashboard():
         return HTMLResponse(DASHBOARD_HTML.read_text(encoding="utf-8"), headers={"Cache-Control": "no-store"})
     except FileNotFoundError:
         return PlainTextResponse("dashboard.html missing from image", status_code=500)
+
+
+@app.get("/manifest.webmanifest")
+def web_manifest(_: None = Depends(auth)):
+    if not MANIFEST_FILE.exists():
+        return PlainTextResponse("manifest.webmanifest missing from image", status_code=500)
+    return FileResponse(
+        MANIFEST_FILE,
+        media_type="application/manifest+json",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@app.get("/sw.js")
+def service_worker(_: None = Depends(auth)):
+    if not SERVICE_WORKER_FILE.exists():
+        return PlainTextResponse("sw.js missing from image", status_code=500)
+    return FileResponse(
+        SERVICE_WORKER_FILE,
+        media_type="text/javascript; charset=utf-8",
+        headers={"Cache-Control": "no-store", "Service-Worker-Allowed": "/"},
+    )
+
+
+@app.get("/icons/{filename}")
+def pwa_icon(filename: str, _: None = Depends(auth)):
+    allowed = {"homeboard-180.png", "homeboard-192.png", "homeboard-512.png"}
+    if filename not in allowed:
+        raise HTTPException(status_code=404, detail="icon not found")
+    path = ICON_DIR / filename
+    if not path.exists():
+        return PlainTextResponse(f"{filename} missing from image", status_code=500)
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
 
 
 def _device_write(action_type: str, target: str, value: Any, fn, *args):
@@ -776,6 +1049,22 @@ def post_mode(body: ModeBody, _: None = Depends(auth)):
 @app.post("/api/temp")
 def post_temp(body: TempBody, _: None = Depends(auth)):
     return _device_write("set_temp", "/api/temp", {"setpoint": body.setpoint}, device.set_temp, body.setpoint)
+
+
+@app.post("/api/room")
+def post_room(body: RoomBody, _: None = Depends(auth)):
+    if ROOM_TTL_SECONDS <= 0 and not READ_ONLY:
+        activity_log.record(
+            source="rest-api",
+            action_type="set_room",
+            target="/api/room",
+            result="blocked",
+            detail="live room feed disabled (NILAN_ROOM_TTL_SECONDS=0)",
+            value=_safe_activity_value({"celsius": body.celsius, "source": body.source}),
+        )
+        raise HTTPException(status_code=409, detail="live room feed disabled (NILAN_ROOM_TTL_SECONDS=0)")
+    return _device_write("set_room", "/api/room", {"celsius": body.celsius, "source": body.source},
+                         device.set_room, body.celsius, body.source)
 
 
 if __name__ == "__main__":

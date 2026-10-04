@@ -112,6 +112,56 @@ Do not remove the `legacy-ui` profile or the `127.0.0.1` bind when testing rollb
 | POST | `/api/fan` | `{"level":0-4}` (0=off) |
 | POST | `/api/mode` | `{"mode":"auto\|heat\|cool\|off"}` |
 | POST | `/api/temp` | `{"setpoint":5-30}` |
+| POST | `/api/room` | `{"celsius":5.0-35.0,"source":"<name>"}` — live room temperature (see below) |
 | MQTT sub | `nilan/fan/set`,`nilan/mode/set`,`nilan/temp/set` | as above (raw value or JSON) |
+| MQTT sub | `nilan/room/set` | plain number in °C (source is recorded as `mqtt`) |
 | MQTT pub | `nilan/state` (retained) | JSON, same shape as `/api/status` |
 | MQTT pub | `nilan/availability` (retained, LWT) | `online`/`offline` |
+
+## Live room temperature
+
+The panel's room sensor (T15) is gone, so the daemon injects the value the unit
+regulates on. Without a feed it injects the constant `NILAN_T15_FALLBACK`. A
+separate sensor can supply a real value instead:
+
+- `POST /api/room` with `{"celsius": 22.4, "source": "living-room"}`, or
+- publish `22.4` to `nilan/room/set`.
+
+Values outside 5.0-35.0 are rejected (`422`; MQTT: ignored). Both paths respect
+`NILAN_READ_ONLY` (blocked and logged, like every other command) and are written
+to the activity log. The value is rounded to the unit's resolution (about
+0.14 °C) and sent under the same device lock as all other commands.
+
+A live value is only trusted for `NILAN_ROOM_TTL_SECONDS` after it was received.
+Keep sending it more often than that (once a minute is plenty). When it expires
+the daemon falls back to `NILAN_T15_FALLBACK` and logs it once. After a
+reconnect to the unit a live value that is still within its TTL is re-applied.
+
+`GET /api/status` (and the retained `nilan/state`) reports both modes:
+
+```json
+"room_source": {"mode": "live", "value": 22.4, "fallback": 21.0,
+                "age_s": 12.3, "source": "living-room", "ttl_s": 900.0}
+```
+
+`mode` is `fallback` (with `age_s` and `source` null) when no fresh live value
+exists. `t_room` keeps showing the temperature the unit actually uses.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `NILAN_T15_FALLBACK` | `21` | Room temperature used when no fresh live value exists |
+| `NILAN_ROOM_TTL_SECONDS` | `900` | Max age of a live value; `0` disables live values entirely |
+
+Rollback: stop sending values and the unit returns to the fallback after the
+TTL. To turn the feature off immediately, set `NILAN_ROOM_TTL_SECONDS=0` and
+restart the API: live values are then refused (`409`; MQTT: ignored) and the
+fallback is always used.
+
+## Tests
+
+```bash
+pip install -r app/requirements.txt pytest httpx
+python -m pytest tests
+```
+
+The tests run the app in mockup mode; no hardware or broker is needed.
