@@ -12,8 +12,9 @@ Implements the API/MQTT contract from TUE-16 plan section 8:
   POST /api/fan    <- { "level": 0-4 }          (0 = off)
   POST /api/mode   <- { "mode": "auto|heat|cool|off" }
   POST /api/temp   <- { "setpoint": 5-30 }
+  POST /api/room   <- { "celsius": 5-35, "source": "..." }  (live room temperature)
 
-  MQTT subscribe: nilan/fan/set, nilan/mode/set, nilan/temp/set
+  MQTT subscribe: nilan/fan/set, nilan/mode/set, nilan/temp/set, nilan/room/set
   MQTT publish  : nilan/state  (retained JSON, same shape as /api/status)
                   nilan/availability ("online"/"offline", retained LWT)
 
@@ -46,7 +47,9 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 # frodef protocol library (vendored under ../vendor, added to sys.path by entrypoint)
-from nilan_cts600 import CTS600, CTS600Mockup, NilanCTS600Exception  # type: ignore
+from nilan_cts600 import (  # type: ignore
+    CTS600, CTS600Mockup, NilanCTS600Exception, nilanADToCelsius, nilanCelsiusToAD,
+)
 
 logging.basicConfig(level=os.environ.get("NILAN_LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -58,6 +61,12 @@ PORT_DEV = os.environ.get("NILAN_PORT", "/dev/ttyNILAN")
 RETRIES = int(os.environ.get("NILAN_RETRIES", "3"))
 POLL_SECONDS = float(os.environ.get("NILAN_POLL_SECONDS", "30"))
 T15_FALLBACK = float(os.environ.get("NILAN_T15_FALLBACK", "21"))
+# Live room temperature (POST /api/room, MQTT <base>/room/set). A live value is used
+# for at most ROOM_TTL_SECONDS after it was received; then the daemon falls back to
+# T15_FALLBACK. 0 disables live values entirely (always fallback).
+ROOM_TTL_SECONDS = float(os.environ.get("NILAN_ROOM_TTL_SECONDS", "900"))
+ROOM_MIN_C = 5.0
+ROOM_MAX_C = 35.0
 API_TOKEN = os.environ.get("NILAN_API_TOKEN", "").strip()  # optional bearer for direct access
 READ_ONLY = os.environ.get("NILAN_READ_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
 ACTIVITY_LOG_MAX = int(os.environ.get("NILAN_ACTIVITY_LOG_MAX", "300"))
@@ -266,6 +275,10 @@ class NilanDevice:
         self._cts: Optional[CTS600] = None
         self._stop = threading.Event()
         self._on_state_change = None  # callback(dict) -> None, set by MQTT layer
+        # Room temperature fed to the unit as T15. `_room_live` is None while the
+        # fallback is in use, else (celsius, source, received_monotonic).
+        self._clock = time.monotonic
+        self._room_live: Optional[tuple[float, str, float]] = None
 
     def set_state_callback(self, cb) -> None:
         self._on_state_change = cb
@@ -300,12 +313,17 @@ class NilanDevice:
                 except Exception as e:  # noqa: BLE001
                     log.warning("setLanguage(%s) failed (non-fatal): %s", SET_LANGUAGE, e)
             if READ_ONLY:
-                log.info("Skipping setT15 fallback because NILAN_READ_ONLY is enabled")
+                log.info("Skipping setT15 injection because NILAN_READ_ONLY is enabled")
             else:
+                # a fresh connection starts from the fallback; re-apply a live
+                # room value that is still within its TTL.
+                live = self._live_room_if_fresh()
                 try:
-                    self._cts.setT15(T15_FALLBACK)
+                    self._cts.setT15(live[0] if live else T15_FALLBACK)
+                    if live:
+                        log.info("Re-applied live room temperature %.2f C after reconnect", live[0])
                 except Exception as e:  # noqa: BLE001
-                    log.warning("setT15 fallback failed (non-fatal): %s", e)
+                    log.warning("setT15 injection failed (non-fatal): %s", e)
             self._connected = True
             self._last_error = None
 
@@ -330,6 +348,7 @@ class NilanDevice:
         # poll
         while not self._stop.is_set():
             try:
+                self.room_watchdog_tick()
                 self.refresh()
                 activity_log.record_status_poll("device-poller", "ok")
             except OSError as e:
@@ -441,6 +460,78 @@ class NilanDevice:
             self._retry("setThermostat", setpoint)
         self.refresh()
 
+    # -- live room temperature --
+    @staticmethod
+    def _snap_room(celsius: float) -> float:
+        """Round to what the unit can represent (AD-converter resolution)."""
+        return round(nilanADToCelsius(nilanCelsiusToAD(celsius)), 2)
+
+    def _live_room_if_fresh(self) -> Optional[tuple[float, str, float]]:
+        live = self._room_live
+        if live is None or ROOM_TTL_SECONDS <= 0:
+            return None
+        return live if self._clock() - live[2] <= ROOM_TTL_SECONDS else None
+
+    def _mock_t15(self, celsius: float) -> None:
+        # the mockup scrapes a static T15; reflect what was injected instead
+        if MOCKUP:
+            self._snapshot = {**self._snapshot, T_ROOM_KEY: celsius}
+
+    def set_room(self, celsius: float, source: str) -> float:
+        """Inject a live room temperature as T15. Returns the value the unit uses."""
+        applied = self._snap_room(celsius)
+        with self._lock:
+            self._retry("setT15", applied)
+            self._room_live = (applied, source, self._clock())
+            self._mock_t15(applied)
+        self._notify_state()
+        return applied
+
+    def room_watchdog_tick(self) -> bool:
+        """Fall back to T15_FALLBACK when the live value is older than the TTL.
+
+        Returns True if a fallback was applied. Logged once per expiry.
+        """
+        with self._lock:
+            live = self._room_live
+            if live is None:
+                return False
+            if ROOM_TTL_SECONDS > 0 and self._clock() - live[2] <= ROOM_TTL_SECONDS:
+                return False
+            age = self._clock() - live[2]
+            if not READ_ONLY and self._cts is not None:
+                self._retry("setT15", T15_FALLBACK)
+            self._room_live = None
+            self._mock_t15(T15_FALLBACK)
+        log.warning("Live room temperature expired (age %.0fs > TTL %.0fs) -> fallback %.1f C",
+                    age, ROOM_TTL_SECONDS, T15_FALLBACK)
+        activity_log.record(
+            source="watchdog",
+            action_type="room_ttl",
+            target="room",
+            result="ok",
+            detail=f"live value from {live[1]} expired after {age:.0f}s; fallback {T15_FALLBACK}",
+            value=_safe_activity_value({"celsius": T15_FALLBACK}),
+        )
+        self._notify_state()
+        return True
+
+    def room_source(self) -> dict[str, Any]:
+        live = self._room_live
+        if live is None:
+            return {"mode": "fallback", "value": T15_FALLBACK, "fallback": T15_FALLBACK,
+                    "age_s": None, "source": None, "ttl_s": ROOM_TTL_SECONDS}
+        return {"mode": "live", "value": live[0], "fallback": T15_FALLBACK,
+                "age_s": round(self._clock() - live[2], 1), "source": live[1],
+                "ttl_s": ROOM_TTL_SECONDS}
+
+    def _notify_state(self) -> None:
+        if self._on_state_change:
+            try:
+                self._on_state_change(self.status())
+            except Exception as e:  # noqa: BLE001
+                log.warning("state callback failed: %s", e)
+
     # -- contract projection (plan section 8) --
     def status(self) -> dict[str, Any]:
         d = self._snapshot
@@ -457,6 +548,7 @@ class NilanDevice:
 
         return {
             "t_room": num(T_ROOM_KEY),
+            "room_source": self.room_source(),
             "t_supply": num(T_SUPPLY_KEY),
             "t_exhaust": num(T_EXHAUST_KEY),
             "fan_level": d.get("flow"),
@@ -507,7 +599,7 @@ class MqttLayer:
     def _on_connect(self, client, userdata, flags, rc, *a):
         log.info("MQTT connected rc=%s", rc)
         client.publish(f"{MQTT_BASE}/availability", "online", qos=1, retain=True)
-        for sub in ("fan/set", "mode/set", "temp/set"):
+        for sub in ("fan/set", "mode/set", "temp/set", "room/set"):
             client.subscribe(f"{MQTT_BASE}/{sub}", qos=1)
         self.publish_state(self.dev.status())
 
@@ -537,6 +629,19 @@ class MqttLayer:
             elif topic.endswith("/temp/set"):
                 value = _coerce_setpoint(payload)
                 self.dev.set_temp(value)
+            elif topic.endswith("/room/set"):
+                try:
+                    value = _coerce_room(payload)
+                    if ROOM_TTL_SECONDS <= 0:
+                        raise ValueError("live room feed disabled (NILAN_ROOM_TTL_SECONDS=0)")
+                except ValueError as e:
+                    activity_log.record(
+                        source="mqtt", action_type="command", target=target,
+                        result="blocked", detail=str(e), value=_safe_activity_value(payload),
+                    )
+                    log.warning("Ignoring MQTT room value %r: %s", payload, e)
+                    return
+                self.dev.set_room(value, "mqtt")
             else:
                 value = payload
             activity_log.record(
@@ -688,6 +793,13 @@ def _coerce_setpoint(payload: str) -> int:
     return sp
 
 
+def _coerce_room(payload: str) -> float:
+    v = float(payload)
+    if not ROOM_MIN_C <= v <= ROOM_MAX_C:  # also rejects nan/inf
+        raise ValueError(f"room temperature out of range {ROOM_MIN_C:g}-{ROOM_MAX_C:g}")
+    return v
+
+
 # ---- FastAPI ----------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -719,6 +831,11 @@ class ModeBody(BaseModel):
 
 class TempBody(BaseModel):
     setpoint: int = Field(ge=5, le=30)
+
+
+class RoomBody(BaseModel):
+    celsius: float = Field(ge=ROOM_MIN_C, le=ROOM_MAX_C, allow_inf_nan=False)
+    source: str = Field(default="api", min_length=1, max_length=40)
 
 
 @app.get("/healthz")
@@ -793,9 +910,12 @@ def get_meta(_: None = Depends(auth)):
             "T5": "Kondensatortemperatur der Wärmepumpe.",
             "T6": "Verdampfertemperatur der Wärmepumpe.",
             "T15": "Fühler im CTS600-Bedienpanel. Das Panel ist durch den ESP ersetzt, "
-                   "daher wird dieser Raumwert vom Daemon injiziert (Fallback) — KEIN echter "
-                   "Live-Raumfühler. Für echte Raumtemperatur einen externen Fühler einspeisen.",
-            "t_room": "Raumtemperatur, die das Gerät zur Regelung nutzt (= T15, aktuell injizierter Fallback).",
+                   "daher injiziert der Daemon diesen Raumwert: live aus einem externen Fühler "
+                   "(POST /api/room, MQTT room/set; verfällt nach dem TTL) oder, ohne frischen "
+                   "Messwert, als fester Fallback — dann KEIN echter Raumfühler.",
+            "t_room": "Raumtemperatur, die das Gerät zur Regelung nutzt (= T15). Modus live: zuletzt "
+                      "per POST /api/room bzw. MQTT room/set gemeldeter Messwert (gilt nur bis zum TTL); "
+                      "Modus fallback: fester Ersatzwert des Daemons. Siehe room_source im Status.",
             "t_supply": "Zulufttemperatur (T2) — Luft, die in die Wohnung geblasen wird.",
             "t_exhaust": "Frischluft/Außen (T1) — angesaugte Außenluft.",
             "setpoint": "Solltemperatur (Thermostat), 5–30 °C — gewünschte Raumtemperatur.",
@@ -929,6 +1049,22 @@ def post_mode(body: ModeBody, _: None = Depends(auth)):
 @app.post("/api/temp")
 def post_temp(body: TempBody, _: None = Depends(auth)):
     return _device_write("set_temp", "/api/temp", {"setpoint": body.setpoint}, device.set_temp, body.setpoint)
+
+
+@app.post("/api/room")
+def post_room(body: RoomBody, _: None = Depends(auth)):
+    if ROOM_TTL_SECONDS <= 0 and not READ_ONLY:
+        activity_log.record(
+            source="rest-api",
+            action_type="set_room",
+            target="/api/room",
+            result="blocked",
+            detail="live room feed disabled (NILAN_ROOM_TTL_SECONDS=0)",
+            value=_safe_activity_value({"celsius": body.celsius, "source": body.source}),
+        )
+        raise HTTPException(status_code=409, detail="live room feed disabled (NILAN_ROOM_TTL_SECONDS=0)")
+    return _device_write("set_room", "/api/room", {"celsius": body.celsius, "source": body.source},
+                         device.set_room, body.celsius, body.source)
 
 
 if __name__ == "__main__":
