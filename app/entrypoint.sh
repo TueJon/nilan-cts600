@@ -20,7 +20,7 @@ if [ "$MOCKUP" = "0" ] && [ "$MOCKUP" != "false" ]; then
   echo "Starting socat tunnel: $NILAN_PORT <-> tcp:${ESP_IP}:${ESP_PORT}"
   (
     while true; do
-      socat -d pty,link="${NILAN_PORT}",raw,echo=0,mode=666 "tcp:${ESP_IP}:${ESP_PORT}" || true
+      socat -d pty,link="${NILAN_PORT}",raw,echo=0,mode=666 "tcp:${ESP_IP}:${ESP_PORT},keepalive,keepidle=60,keepintvl=10,keepcnt=5" || true
       echo "socat exited; reconnecting to ${ESP_IP}:${ESP_PORT} in 5s" >&2
       sleep 5
     done
