@@ -584,7 +584,7 @@ class MqttLayer:
             return
         import paho.mqtt.client as mqtt  # local import so REST works without paho
 
-        c = mqtt.Client(client_id="nilan-api")
+        c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="nilan-api")
         if MQTT_USER:
             c.username_pw_set(MQTT_USER, MQTT_PASS)
         c.will_set(f"{MQTT_BASE}/availability", "offline", qos=1, retain=True)
@@ -596,8 +596,8 @@ class MqttLayer:
         c.loop_start()
         log.info("MQTT connecting to %s:%s base=%s", MQTT_HOST, MQTT_PORT, MQTT_BASE)
 
-    def _on_connect(self, client, userdata, flags, rc, *a):
-        log.info("MQTT connected rc=%s", rc)
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        log.info("MQTT connected rc=%s", reason_code)
         client.publish(f"{MQTT_BASE}/availability", "online", qos=1, retain=True)
         for sub in ("fan/set", "mode/set", "temp/set", "room/set"):
             client.subscribe(f"{MQTT_BASE}/{sub}", qos=1)
