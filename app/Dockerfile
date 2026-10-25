@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # socat: creates the in-container /dev/ttyNILAN PTY from the ESP raw-TCP stream.
 RUN apt-get update && apt-get install -y --no-install-recommends socat \
