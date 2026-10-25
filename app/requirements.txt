@@ -4,3 +4,6 @@ pydantic==2.10.4
 pymodbus>=3.8.3
 pyserial>=3.5
 paho-mqtt==2.1.0
+# Security floors for transitive dependencies (same major/minor as currently resolved)
+anyio>=4.14.2  # via starlette, watchfiles
+h11>=0.16.0  # via uvicorn
