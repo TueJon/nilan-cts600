@@ -160,7 +160,7 @@ fallback is always used.
 ## Tests
 
 ```bash
-pip install -r app/requirements.txt pytest httpx
+pip install -r app/requirements.txt pytest httpx2
 python -m pytest tests
 ```
 
