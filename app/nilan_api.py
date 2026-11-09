@@ -45,6 +45,7 @@ from fastapi import FastAPI, HTTPException, Header, Depends, Query
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 import uvicorn
+from pymodbus.exceptions import ConnectionException
 
 # frodef protocol library (vendored under ../vendor, added to sys.path by entrypoint)
 from nilan_cts600 import (  # type: ignore
@@ -351,7 +352,7 @@ class NilanDevice:
                 self.room_watchdog_tick()
                 self.refresh()
                 activity_log.record_status_poll("device-poller", "ok")
-            except OSError as e:
+            except (OSError, ConnectionException) as e:
                 self._connected = False
                 self._last_error = str(e)
                 activity_log.record_status_poll("device-poller", "error", str(e))
@@ -406,9 +407,10 @@ class NilanDevice:
         Retries on:
           * ``NilanCTS600Exception`` / ``TimeoutError`` — transient protocol/bus
             timeouts (single garbled frame). Plain retry.
-          * ``OSError`` (e.g. ``[Errno 5] Input/output error``) — the socat PTY
+          * ``OSError`` or pymodbus ``ConnectionException`` — the socat PTY
             blipped/was re-created, so the serial handle is stale. Reconnect
-            first, then retry. This is the write-path failure Jonas hit.
+            first, then retry. pymodbus 3.16 wraps serial OSErrors in
+            ConnectionException.
         """
         last = None
         for attempt in range(1, RETRIES + 1):
@@ -419,13 +421,16 @@ class NilanDevice:
                 log.warning("device op %s attempt %d/%d failed: %s",
                             method, attempt, RETRIES, e)
                 time.sleep(0.3)
-            except OSError as e:
+            except (OSError, ConnectionException) as e:
                 last = e
                 log.warning("device op %s attempt %d/%d I/O error (%s) -> reconnecting",
                             method, attempt, RETRIES, e)
+                self._connected = False
                 try:
                     self.connect()
                 except Exception as ce:  # noqa: BLE001
+                    self._connected = False
+                    self._last_error = str(ce)
                     log.warning("reconnect after I/O error failed: %s", ce)
                 time.sleep(0.6)
         raise last if last else RuntimeError("device op failed")
