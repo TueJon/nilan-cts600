@@ -18,6 +18,13 @@ filesystem paths in a private operator runbook.
 
 ## 2026-06-19 — Live bringup diagnosis (Wattson)
 
+**Historical record, superseded UART setting:** the later live-verified ESP UART
+setting is **19200 8N1** (`parity: NONE`, `stop_bits: 1`). Older cores tolerated
+the extra stop bit below; newer cores reject/mangle received frames. Use
+[`firmware/reliable/README.md`](../firmware/reliable/README.md) for the current
+dual-transport firmware and rollout procedure. Do not reapply the historical
+8N2 reflash instructions below.
+
 On-site wiring done by the operator; test driven from `<deployment-host>` on the
 same local network.
 

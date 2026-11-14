@@ -1,3 +1,4 @@
+# Legacy ESPHome alternative; see reliable/README.md for dual USB/Wi-Fi recovery.
 # ESPHome: Nilan CTS600 — transparent RAW Serial<->TCP Tunnel
 # Board: Waveshare ESP32-S3-RS485-CAN (RS-485 transceiver onboard + isolated)
 # Role: WLAN<->RS-485 bytes 1:1. No Modbus interpretation on the ESP.
@@ -14,6 +15,9 @@ esp32:
 logger:
   hardware_uart: USB_SERIAL_JTAG
 api:
+  # No native API consumer is required for the raw tunnel. Do not reboot every
+  # 15 minutes just because a Home Assistant client is absent.
+  reboot_timeout: 0s
   encryption:
     key: !secret api_key
 ota:
@@ -22,6 +26,9 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  power_save_mode: none
+  # Preserve fallback access during an AP outage; no whole-device reboot loop.
+  reboot_timeout: 0s
   # Static IP is recommended because tj-lt socat connects to this endpoint.
   # manual_ip:
   #   static_ip: 192.168.1.50
@@ -33,8 +40,11 @@ wifi:
 captive_portal:
 web_server:
   port: 80
+  auth:
+    username: admin
+    password: !secret ota_password
 external_components:
-  - source: github://oxan/esphome-stream-server
+  - source: github://oxan/esphome-stream-server@9e05b0a3fea78a0ab7c11338327e5492f0c95b43
 uart:
   id: nilan_uart
   tx_pin: GPIO17
@@ -42,13 +52,10 @@ uart:
   flow_control_pin: GPIO21
   baud_rate: 19200
   data_bits: 8
-  # CTS600 framing is 8N2 (NO parity, 2 stop bits) — matches the proven frodef
-  # reference driver (ModbusSerialClient parity='N', stopbits=2). The earlier
-  # 8E1 guess from the research note was WRONG: with parity:EVEN the ESP-IDF/
-  # Arduino UART mangles the slave's reply (verified on-site 2026-06-19: the bus
-  # answers with a 31-byte frame but every Modbus CRC fails). 8N2 = correct.
+  # The unit sends 8N1. Older UART cores tolerated a second stop-bit setting;
+  # newer ones reject/mangle replies. Live frame/readback checks confirm 8N1.
   parity: NONE
-  stop_bits: 2
+  stop_bits: 1
   rx_buffer_size: 512
 stream_server:
   uart_id: nilan_uart

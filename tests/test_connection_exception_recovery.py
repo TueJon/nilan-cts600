@@ -46,6 +46,7 @@ def test_retry_reconnects_after_connection_exception(monkeypatch):
 
 
 def test_failed_reconnect_clears_connected_for_watchdog(monkeypatch):
+    monkeypatch.setattr(nilan_api, "MOCKUP", False)
     monkeypatch.setattr(nilan_api, "RETRIES", 1)
     monkeypatch.setattr(nilan_api.time, "sleep", lambda _: None)
     device = nilan_api.NilanDevice()
@@ -67,7 +68,7 @@ def test_failed_reconnect_clears_connected_for_watchdog(monkeypatch):
 
     monkeypatch.setattr(nilan_api, "WATCHDOG_STARTUP_GRACE_SECONDS", 0)
     monkeypatch.setattr(nilan_api, "WATCHDOG_CHECK_SECONDS", 0)
-    monkeypatch.setattr(nilan_api.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(nilan_api.time, "monotonic", lambda: 1000.0)
 
     class StopAfterOneCheck:
         calls = 0
@@ -80,7 +81,7 @@ def test_failed_reconnect_clears_connected_for_watchdog(monkeypatch):
     watchdog._started_ts = 0
     watchdog._stop = StopAfterOneCheck()
     watchdog._loop()
-    assert watchdog._disconnected_since == 1000.0
+    assert watchdog._degraded_since == 1000.0
 
 
 def test_poll_reconnects_when_pymodbus_raises_connection_exception(monkeypatch):
@@ -125,7 +126,7 @@ def test_poll_failed_reconnect_leaves_watchdog_armed(monkeypatch):
     monkeypatch.setattr(nilan_api.os.path, "exists", lambda _path: True)
     monkeypatch.setattr(nilan_api, "WATCHDOG_STARTUP_GRACE_SECONDS", 0)
     monkeypatch.setattr(nilan_api, "WATCHDOG_CHECK_SECONDS", 0)
-    monkeypatch.setattr(nilan_api.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(nilan_api.time, "monotonic", lambda: 1000.0)
     device = nilan_api.NilanDevice()
     connect_calls = []
 
@@ -160,7 +161,7 @@ def test_poll_failed_reconnect_leaves_watchdog_armed(monkeypatch):
     watchdog._started_ts = 0
     watchdog._stop = StopAfterPoll()
     watchdog._loop()
-    assert watchdog._disconnected_since == 1000.0
+    assert watchdog._degraded_since == 1000.0
 
 
 def test_exhausted_connection_exception_write_keeps_502_mapping():
@@ -171,3 +172,90 @@ def test_exhausted_connection_exception_write_keeps_502_mapping():
         nilan_api._device_write("set_temp", "/api/temp", {"setpoint": 20}, fail_write, 20)
 
     assert error.value.status_code == 502
+
+
+def test_watchdog_does_not_restart_offline_worker_that_keeps_retrying(monkeypatch):
+    monkeypatch.setattr(nilan_api, "MOCKUP", False)
+    monkeypatch.setattr(nilan_api, "WATCHDOG_STARTUP_GRACE_SECONDS", 0)
+    monkeypatch.setattr(nilan_api, "WATCHDOG_CHECK_SECONDS", 1)
+    monkeypatch.setattr(nilan_api, "WATCHDOG_THRESHOLD_SECONDS", 3)
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(nilan_api.time, "monotonic", lambda: clock.now)
+    device = nilan_api.NilanDevice()
+    device._connected = False
+    device._worker_progress()
+    restarts = []
+    watchdog = nilan_api.LivenessWatchdog(device)
+    watchdog._started_ts = clock.now - 1
+    watchdog._trigger_restart = lambda elapsed: restarts.append(elapsed)
+
+    class RetryingOfflineWorker:
+        calls = 0
+
+        def wait(self, seconds):
+            self.calls += 1
+            clock.now += seconds
+            device._worker_progress()  # each bounded retry-wait heartbeat
+            return self.calls >= 5
+
+    watchdog._stop = RetryingOfflineWorker()
+    watchdog._loop()
+
+    assert restarts == []
+    assert watchdog._degraded_since == 1001.0
+
+
+def test_bounded_wait_refreshes_worker_heartbeat(monkeypatch):
+    monkeypatch.setattr(nilan_api, "WATCHDOG_CHECK_SECONDS", 5)
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(nilan_api.time, "monotonic", lambda: clock.now)
+    device = nilan_api.NilanDevice()
+
+    class AdvanceClock:
+        calls = 0
+
+        def is_set(self):
+            return False
+
+        def wait(self, seconds):
+            self.calls += 1
+            clock.now += seconds
+            return False
+
+    device._stop = AdvanceClock()
+    initial = device._worker_last_progress_monotonic
+    device._wait_with_progress(12)
+
+    assert device._stop.calls == 3
+    assert device._worker_last_progress_monotonic > initial
+
+
+def test_watchdog_restarts_a_poll_worker_stuck_in_a_vendor_call(monkeypatch):
+    monkeypatch.setattr(nilan_api, "MOCKUP", False)
+    monkeypatch.setattr(nilan_api, "WATCHDOG_STARTUP_GRACE_SECONDS", 0)
+    monkeypatch.setattr(nilan_api, "WATCHDOG_CHECK_SECONDS", 1)
+    monkeypatch.setattr(nilan_api, "WATCHDOG_THRESHOLD_SECONDS", 3)
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(nilan_api.time, "monotonic", lambda: clock.now)
+    device = nilan_api.NilanDevice()
+    device._connected = True
+    device._snapshot = {"T15": 20, "T1": 16, "T5": 17, "status": "AUTO"}
+    device._last_update_monotonic = clock.now
+    device._worker_last_progress_monotonic = clock.now
+    restarts = []
+    watchdog = nilan_api.LivenessWatchdog(device)
+    watchdog._started_ts = clock.now - 1
+    watchdog._trigger_restart = lambda elapsed: restarts.append(elapsed)
+
+    class ClockOnly:
+        calls = 0
+
+        def wait(self, seconds):
+            self.calls += 1
+            clock.now += seconds
+            return self.calls >= 4
+
+    watchdog._stop = ClockOnly()
+    watchdog._loop()
+
+    assert restarts == [3.0]

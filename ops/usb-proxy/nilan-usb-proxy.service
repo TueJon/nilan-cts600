@@ -1,0 +1,39 @@
+[Unit]
+Description=Optional Nilan USB serial to raw TCP fallback
+Documentation=file:/usr/share/doc/nilan-cts600/usb-proxy.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/default/nilan-usb-proxy
+StartLimitIntervalSec=0s
+
+[Service]
+Type=simple
+User=nilan-proxy
+Group=dialout
+RuntimeDirectory=nilan-usb-proxy
+RuntimeDirectoryMode=0750
+EnvironmentFile=/etc/default/nilan-usb-proxy
+ExecStartPre=+/usr/bin/python3 /usr/local/libexec/nilan-usb-proxy-alias.py add
+ExecStart=/usr/bin/python3 /usr/local/libexec/nilan-usb-proxy.py
+ExecStopPost=+/usr/bin/python3 /usr/local/libexec/nilan-usb-proxy-alias.py remove
+Restart=always
+RestartSec=5s
+TimeoutStopSec=5s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+SystemCallArchitectures=native
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

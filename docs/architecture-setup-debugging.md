@@ -64,9 +64,17 @@ The ESP must not translate protocol semantics. It is not a Modbus-TCP gateway.
 The server side owns protocol parsing, polling, command serialization, retries,
 state projection, REST validation, and MQTT integration.
 
-Serial framing is `19200 8N2` (`data_bits: 8`, `parity: NONE`,
-`stop_bits: 2`). The earlier `8E1` assumption was proven wrong during live
+Serial framing is the live-verified `19200 8N1` (`data_bits: 8`, `parity: NONE`,
+`stop_bits: 1`). Older UART cores tolerated an extra stop-bit setting; newer
+cores reject/mangle those replies. The earlier `8E1` assumption was proven wrong during live
 bring-up: replies arrived, but bytes were mangled and CRC validation failed.
+
+The maintained dual-transport replacement is documented in
+[`firmware/reliable/README.md`](../firmware/reliable/README.md). Its web
+interface is authenticated and it does not expose ESPHome native API/6053.
+The ESPHome API and stream_server references below describe the legacy image.
+USB fallback uses [`ops/usb-proxy`](../ops/usb-proxy/README.md); there must be
+exactly one protocol owner and one selected server endpoint.
 
 ## Runtime Modes and Safety Gates
 
@@ -163,6 +171,7 @@ Health/API checks from `<deployment-host>`:
 
 ```bash
 curl -fsS http://127.0.0.1:8642/healthz | jq
+curl -i http://127.0.0.1:8642/readyz
 curl -fsS http://127.0.0.1:8642/api/status | jq
 curl -fsS http://127.0.0.1:8642/api/meta | jq
 ```
@@ -223,7 +232,8 @@ endpoint. Nothing publishes the API on a host interface in the normal profile.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/` | Web dashboard. |
-| `GET` | `/healthz` | Container health and basic flags. |
+| `GET` | `/healthz` | Process liveness; HTTP can remain available during a bridge outage. |
+| `GET` | `/readyz` | Physical readiness; requires a complete, recent poll in real-device mode (HTTP 503 otherwise). Mockup mode reports explicitly that it is not physical. |
 | `GET` | `/api/meta` | Self-describing labels, units, config envelope, controls, bridge target. |
 | `GET` | `/api/status` | Current projected state plus raw decoded snapshot. |
 | `GET` | `/api/activity?include_reads=false&limit=100` | Bounded in-memory activity log; read polls are summarized and hidden unless requested. |
@@ -238,6 +248,23 @@ endpoint. Nothing publishes the API on a host interface in the normal profile.
 - `sensors`: decoded `T*` sensor values
 - `raw`: full frodef snapshot
 - `connected`, `mockup`, `read_only`, `last_update_ts`, `last_error`
+- `sample_age_seconds` and `telemetry_ready`, so consumers can distinguish a live process from fresh physical readings.
+
+The raw TCP tunnel has one owner at a time. Configure `ESP_IP` and its DHCP
+reservation as the primary path. Optionally set `ESP_FALLBACK_IP` (and, if needed,
+`ESP_FALLBACK_PORT`) to a separate USB proxy endpoint. The supervisor attempts
+the primary first, keeps that stream until it closes, and only then tries the
+fallback; it never opens both transports concurrently. It retries both in order
+with bounded connect and increasing backoff. Keep the fallback endpoint on the
+private home network and do not expose TCP/6638 publicly.
+
+If the API keeps running but physical polls remain invalid or absent for
+`NILAN_TUNNEL_RECOVERY_THRESHOLD_SECONDS` (default 180), it writes a private
+atomic marker at `NILAN_TUNNEL_RECOVERY_FILE`. The supervisor closes the current
+`socat` session before advancing to the next configured endpoint. A 180 second
+cooldown prevents repeated rotations during a sustained outage; any fresh
+physical poll resets the recovery timer. The process coordinator separately
+restarts the container if either the API or tunnel supervisor exits unexpectedly.
 
 Writes use the same device lock as the poller and MQTT commands. A protocol
 failure should return `502` instead of crashing the service.
@@ -359,7 +386,7 @@ Required firmware framing:
 baud_rate: 19200
 data_bits: 8
 parity: NONE
-stop_bits: 2
+stop_bits: 1
 ```
 
 Next actions:

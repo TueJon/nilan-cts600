@@ -3,3 +3,6 @@ mosquitto/passwd
 caddy/Caddyfile.local
 *.log
 __pycache__/
+firmware/reliable/.pio/
+firmware/reliable/include/secrets.h
+firmware/reliable/*.bin
