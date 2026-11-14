@@ -39,6 +39,9 @@ The first active USB or allowlisted TCP client owns UART exclusively. The other
 transport is rejected/drained; it cannot interleave protocol frames. USB ownership
 ends when the port closes; either lease expires after 120 seconds without a new
 request. Normal polling must be well below that timeout (default 30 seconds).
+TCP peers are checked by keepalive after 15 idle seconds, every 5 seconds, with
+three failed probes ending the session. This also releases a stranded UART owner
+when the controller disappears while USB fallback is waiting.
 Orphan UART replies are flushed at ownership boundaries. Short writes and network
 backpressure close the session; buffered commands are never replayed on reconnect.
 
