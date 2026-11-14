@@ -13,10 +13,11 @@
 #include <esp_task_wdt.h>
 #include <atomic>
 #include <sys/socket.h>
+#include <lwip/sockets.h>
 #include "policy.h"
 #include "secrets.h"
 
-constexpr char VERSION[] = "2.0.1";
+constexpr char VERSION[] = "2.0.2";
 constexpr char HOSTNAME[] = "nilan-bridge";
 constexpr uint16_t TCP_PORT = 6638;
 constexpr uint32_t WIFI_ATTEMPT_MS = 20000;
@@ -190,7 +191,16 @@ void busTick(uint32_t now) {
     if (incoming.remoteIP() == controller && policy::canClaim(owner,policy::Owner::tcp)) {
       if (owner == policy::Owner::none) {
         uart_flush_input(UART); tcp = incoming; tcp.setNoDelay(true);
-        tcp.setTimeout(50); owner = policy::Owner::tcp; lastTcpRx = now; event("tcp_claimed");
+        tcp.setTimeout(50);
+        // A disappeared controller must not hold the UART until the idle lease
+        // expires while USB is already trying to recover the same server.
+        int enabled=1, idle=15, interval=5, probes=3;
+        bool peerWatch=setsockopt(tcp.fd(),SOL_SOCKET,SO_KEEPALIVE,&enabled,sizeof(enabled))==0 &&
+          setsockopt(tcp.fd(),IPPROTO_TCP,TCP_KEEPIDLE,&idle,sizeof(idle))==0 &&
+          setsockopt(tcp.fd(),IPPROTO_TCP,TCP_KEEPINTVL,&interval,sizeof(interval))==0 &&
+          setsockopt(tcp.fd(),IPPROTO_TCP,TCP_KEEPCNT,&probes,sizeof(probes))==0;
+        if(!peerWatch){++transportFaults;closeTransport("tcp_keepalive_failed");return;}
+        owner = policy::Owner::tcp; lastTcpRx = now; event("tcp_claimed");
       } else { incoming.stop(); ++rejectedClients; }
     } else { incoming.stop(); ++rejectedClients; }
   }
