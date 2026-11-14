@@ -92,7 +92,7 @@ HEALTH_STALE_SECONDS = float(os.environ.get(
     "NILAN_HEALTH_STALE_SECONDS", str(max(90.0, POLL_SECONDS * 3))))
 TUNNEL_RECOVERY_FILE = os.environ.get("NILAN_TUNNEL_RECOVERY_FILE", "/run/nilan-tunnel-recover")
 TUNNEL_RECOVERY_THRESHOLD_SECONDS = float(
-    os.environ.get("NILAN_TUNNEL_RECOVERY_THRESHOLD_SECONDS", "180"))
+    os.environ.get("NILAN_TUNNEL_RECOVERY_THRESHOLD_SECONDS", "60"))
 TUNNEL_RECOVERY_COOLDOWN_SECONDS = float(
     os.environ.get("NILAN_TUNNEL_RECOVERY_COOLDOWN_SECONDS", "180"))
 # Panel language to set at connect so frodef's English SHOW-DATA menu regexes
