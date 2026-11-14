@@ -109,11 +109,6 @@ def test_mockup_readiness_is_explicit_and_does_not_claim_physical(monkeypatch):
     assert state["physical"] is False
 
 
-def test_silent_protocol_tunnel_rotation_fits_within_readiness_stale_window():
-    assert nilan_api.TUNNEL_RECOVERY_THRESHOLD_SECONDS == 60
-    assert nilan_api.TUNNEL_RECOVERY_THRESHOLD_SECONDS + nilan_api.WATCHDOG_CHECK_SECONDS <= nilan_api.HEALTH_STALE_SECONDS
-
-
 def test_readyz_returns_503_when_physical_data_is_stale(monkeypatch):
     monkeypatch.setattr(nilan_api.device, "readiness", lambda: {
         "ready": False, "connected": False, "physical": True,

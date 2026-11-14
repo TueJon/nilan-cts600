@@ -1,4 +1,10 @@
+import os
+import select
+import shutil
+import socket
+import subprocess
 import threading
+import time
 
 import pytest
 
@@ -21,13 +27,64 @@ def test_endpoint_config_fails_closed_without_primary_and_deduplicates_fallback(
     }) == [Endpoint("192.0.2.30", 6638)]
 
 
-def test_socat_tcp_failure_detection_uses_short_keepalive_and_user_timeout():
-    command = socat_command(Endpoint("192.0.2.30", 6638), "/dev/ttyNILAN")
-    assert command[0] == "socat"
-    assert command[-1] == (
-        "tcp:192.0.2.30:6638,connect-timeout=5,keepalive,"
-        "keepidle=15,keepintvl=5,keepcnt=3,setsockopt-int=6:18:15000"
-    )
+@pytest.mark.skipif(shutil.which("socat") is None, reason="socat is required for PTY tunnel integration")
+def test_socat_tunnel_options_open_and_carry_raw_bytes_both_directions(tmp_path):
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(5)
+    tty = tmp_path / "nilan-pty"
+    proc = None
+    tcp = None
+    pty_fd = None
+    try:
+        command = socat_command(Endpoint("127.0.0.1", listener.getsockname()[1]), str(tty))
+        proc = subprocess.Popen(command, start_new_session=True,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        tcp, _ = listener.accept()
+        deadline = time.monotonic() + 3
+        while not tty.exists() and time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise AssertionError(f"socat exited before creating PTY: {proc.stderr.read()!r}")
+            time.sleep(0.01)
+        assert tty.exists(), "socat did not create the PTY link"
+        pty_fd = os.open(tty, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+
+        inbound = b"\x00nilan-from-tcp\r\n"
+        tcp.sendall(inbound)
+        readable, _, _ = select.select([pty_fd], [], [], 3)
+        assert readable, "TCP bytes did not reach the PTY"
+        received = bytearray()
+        while len(received) < len(inbound):
+            readable, _, _ = select.select([pty_fd], [], [], 3)
+            assert readable, "TCP bytes did not fully reach the PTY"
+            received.extend(os.read(pty_fd, len(inbound) - len(received)))
+        assert bytes(received) == inbound
+
+        outbound = b"\x00nilan-from-pty\r\n"
+        os.write(pty_fd, outbound)
+        tcp.settimeout(3)
+        received_tcp = bytearray()
+        while len(received_tcp) < len(outbound):
+            chunk = tcp.recv(len(outbound) - len(received_tcp))
+            assert chunk, "PTY closed before all bytes reached TCP"
+            received_tcp.extend(chunk)
+        assert bytes(received_tcp) == outbound
+    finally:
+        if pty_fd is not None:
+            os.close(pty_fd)
+        if tcp is not None:
+            tcp.close()
+        listener.close()
+        if proc is not None:
+            if proc.poll() is None:
+                os.killpg(proc.pid, 15)
+            try:
+                proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, 9)
+                proc.communicate(timeout=3)
 
 
 def test_fallback_is_opened_only_after_primary_stream_closes():

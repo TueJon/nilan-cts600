@@ -263,9 +263,12 @@ If the API keeps running but physical polls remain invalid or absent for
 atomic marker at `NILAN_TUNNEL_RECOVERY_FILE`. The supervisor closes the current
 `socat` session before advancing to the next configured endpoint. A 180 second
 cooldown prevents repeated rotations during a sustained outage; any fresh
-physical poll resets the recovery timer. The 60 second trigger leaves room for
-the 15 second watchdog check cadence while keeping silent-protocol recovery
-inside the 90 second physical-readiness stale window. The process coordinator separately
+physical poll resets the recovery timer. Once the watchdog classifies telemetry
+as degraded, the 60 second trigger is observed on its next 15 second check, so
+rotation begins 60–75 seconds after classification. This is independent of how
+long it took the last sample to become stale. TCP blackholes also have 15 second
+`TCP_USER_TIMEOUT`; idle connections start keepalive probes after 15 seconds,
+then retry every 5 seconds up to three probes. The process coordinator separately
 restarts the container if either the API or tunnel supervisor exits unexpectedly.
 
 Writes use the same device lock as the poller and MQTT commands. A protocol
