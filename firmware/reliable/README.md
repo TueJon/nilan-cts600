@@ -102,11 +102,11 @@ hardware-validation change, not an unreviewed dependency update.
    downloader by opening the running CDC serial device at 115200 baud, changing
    it to 1200 baud, then closing it. The device disconnects and re-enumerates as
    the ROM USB/JTAG downloader; refresh the device path after re-enumeration.
-   Following this 1200-baud touch, use esptool's `--before no-reset`. **Do not
-   use `--before usb-reset`** here: it resets the chip out of the ROM downloader
-   before esptool can connect. The 1200-baud setting may report an immediate
-   USB I/O error as the product changes; confirm the ROM device appeared
-   instead of repeatedly trying reset modes.
+   Following this 1200-baud touch, use esptool's `--before no_reset`. A prior
+   attempt with `usb_reset` returned no serial data; use the verified no-reset
+   sequence and do not cycle through reset variants. The 1200-baud setting may
+   report an immediate USB I/O error as the product changes; confirm the ROM
+   device appeared.
 
 5. Before touching flash, preserve the NVS partition. In this layout it is
    `0x9000` through `0xdfff` (`0x5000` bytes); it contains the saved Wi-Fi
@@ -121,7 +121,9 @@ hardware-validation change, not an unreviewed dependency update.
 
    ```bash
    umask 077
-   esptool-4.5.1 --chip esp32s3 --port "$PORT" read-flash 0x9000 0x5000 "$PRIVATE_DIR/nilan-nvs-before.bin"
+   esptool-4.5.1 --chip esp32s3 --port "$PORT" \
+     --before no_reset --after no_reset --baud 921600 \
+     read_flash 0x9000 0x5000 "$PRIVATE_DIR/nilan-nvs-before.bin"
    chmod 600 "$PRIVATE_DIR/nilan-nvs-before.bin"
    sha256sum "$PRIVATE_DIR/nilan-nvs-before.bin"
    ```
@@ -131,7 +133,8 @@ hardware-validation change, not an unreviewed dependency update.
    environment; the application image is `firmware.bin`:
 
    ```bash
-   esptool-4.5.1 --chip esp32s3 --port "$PORT" --before no-reset write-flash \
+   esptool-4.5.1 --chip esp32s3 --port "$PORT" \
+     --before no_reset --after no_reset --baud 921600 write_flash \
      0x0000 "$BUILD_DIR/bootloader.bin" \
      0x8000 "$BUILD_DIR/partitions.bin" \
      0xe000 "$BOOT_APP0_BIN" \
