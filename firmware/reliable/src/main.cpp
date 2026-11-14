@@ -16,7 +16,7 @@
 #include "policy.h"
 #include "secrets.h"
 
-constexpr char VERSION[] = "2.0.0";
+constexpr char VERSION[] = "2.0.1";
 constexpr char HOSTNAME[] = "nilan-bridge";
 constexpr uint16_t TCP_PORT = 6638;
 constexpr uint32_t WIFI_ATTEMPT_MS = 20000;
@@ -120,6 +120,9 @@ void wifiTick(uint32_t now) {
     previousSsid = ssid; previousPassword = password;
     ssid = candidateSsid; password = candidatePassword;
     testingCandidate = true; candidateStart = now; candidateStableSince = 0;
+    // Let the controller observe a clean close before the radio goes away.
+    // Otherwise TCP keepalive can delay the USB fallback after a planned change.
+    if(owner==policy::Owner::tcp){closeTransport("wifi_candidate_switch");delay(50);}
     WiFi.disconnect(false, false); wifiAttempt = false; nextAttemptAt = now;
     event("wifi_candidate_started");
   }
