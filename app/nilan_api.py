@@ -30,6 +30,7 @@ poll snapshot; writes are serialized behind a single device lock.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -42,7 +43,7 @@ from typing import Any, Optional
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Query
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
 from pymodbus.exceptions import ConnectionException
@@ -78,18 +79,22 @@ HTTP_PORT = int(os.environ.get("NILAN_HTTP_PORT", "8642"))
 ESP_IP = os.environ.get("ESP_IP", "").strip()       # live ESP bridge IP (real mode)
 ESP_PORT = os.environ.get("ESP_PORT", "6638").strip()
 
-# Liveness watchdog (TUE-307). The container healthcheck only proves the HTTP
-# server is up; it stays green while the device is `connected:false` and the
-# ventilation.* values go stale (e.g. the long-lived single-client ESP raw-TCP
-# tunnel wedges — ARP flux/WiFi flap — and the in-process socat reconnect can't
-# recover). This watchdog detects a *sustained* disconnect and exits the process
-# so Docker's `restart: unless-stopped` re-runs entrypoint.sh for a fresh socat
-# tunnel — the proven recovery (TUE-307: `docker compose restart nilan-api`).
-# The threshold ensures brief ESP flaps never trigger a restart loop.
+# Worker watchdog (TUE-307). The API remains alive and reports `/readyz` as
+# degraded while the bridge is unreachable. Container restart is reserved for
+# a truly stalled poll/reconnect worker, not normal offline retry cycles.
 WATCHDOG_ENABLED = os.environ.get("NILAN_WATCHDOG_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 WATCHDOG_THRESHOLD_SECONDS = float(os.environ.get("NILAN_WATCHDOG_THRESHOLD_SECONDS", "180"))
 WATCHDOG_CHECK_SECONDS = float(os.environ.get("NILAN_WATCHDOG_CHECK_SECONDS", "15"))
 WATCHDOG_STARTUP_GRACE_SECONDS = float(os.environ.get("NILAN_WATCHDOG_STARTUP_GRACE_SECONDS", "90"))
+# A fresh physical sample must arrive before this age. Readiness remains
+# explicitly false for mockup mode, which has its own declared test semantics.
+HEALTH_STALE_SECONDS = float(os.environ.get(
+    "NILAN_HEALTH_STALE_SECONDS", str(max(90.0, POLL_SECONDS * 3))))
+TUNNEL_RECOVERY_FILE = os.environ.get("NILAN_TUNNEL_RECOVERY_FILE", "/run/nilan-tunnel-recover")
+TUNNEL_RECOVERY_THRESHOLD_SECONDS = float(
+    os.environ.get("NILAN_TUNNEL_RECOVERY_THRESHOLD_SECONDS", "180"))
+TUNNEL_RECOVERY_COOLDOWN_SECONDS = float(
+    os.environ.get("NILAN_TUNNEL_RECOVERY_COOLDOWN_SECONDS", "180"))
 # Panel language to set at connect so frodef's English SHOW-DATA menu regexes
 # match (temperatures). Empty string disables. Default ENGLISH.
 SET_LANGUAGE = os.environ.get("NILAN_SET_LANGUAGE", "ENGLISH").strip()
@@ -273,6 +278,9 @@ class NilanDevice:
         self._connected = False
         self._last_error: Optional[str] = None
         self._last_update_ts: float = 0.0
+        self._last_update_monotonic: float = 0.0
+        self._connect_failures = 0
+        self._worker_last_progress_monotonic = time.monotonic()
         self._cts: Optional[CTS600] = None
         self._stop = threading.Event()
         self._on_state_change = None  # callback(dict) -> None, set by MQTT layer
@@ -327,6 +335,7 @@ class NilanDevice:
                     log.warning("setT15 injection failed (non-fatal): %s", e)
             self._connected = True
             self._last_error = None
+            self._connect_failures = 0
 
     def start(self) -> None:
         t = threading.Thread(target=self._poll_loop, name="nilan-poll", daemon=True)
@@ -335,24 +344,53 @@ class NilanDevice:
     def stop(self) -> None:
         self._stop.set()
 
+    def _worker_progress(self) -> None:
+        """Heartbeat for actual poll/reconnect worker progress, not device health."""
+        self._worker_last_progress_monotonic = time.monotonic()
+
+    def _wait_with_progress(self, seconds: float) -> None:
+        """Wait without making normal offline retries look like a dead worker."""
+        seconds = max(0.0, seconds)
+        if seconds == 0:
+            self._worker_progress()
+            self._stop.wait(0)
+            return
+        deadline = time.monotonic() + seconds
+        while not self._stop.is_set():
+            self._worker_progress()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            interval = WATCHDOG_CHECK_SECONDS if WATCHDOG_CHECK_SECONDS > 0 else remaining
+            if self._stop.wait(min(remaining, interval)):
+                return
+
     def _poll_loop(self) -> None:
         # initial connect with retry
         while not self._stop.is_set():
+            self._worker_progress()
             try:
                 self.connect()
+                self._worker_progress()
                 break
             except Exception as e:  # noqa: BLE001
                 self._connected = False
                 self._last_error = str(e)
-                log.warning("Connect failed, retrying in 10s: %s", e)
-                self._stop.wait(10)
+                delay = min(60.0, 10.0 * (2 ** min(self._connect_failures, 3)))
+                self._connect_failures += 1
+                log.warning("Connect failed, retrying in %.0fs: %s", delay, e)
+                self._worker_progress()
+                self._wait_with_progress(delay)
         # poll
         while not self._stop.is_set():
+            self._worker_progress()
             try:
                 self.room_watchdog_tick()
                 self.refresh()
+                self._worker_progress()
                 activity_log.record_status_poll("device-poller", "ok")
             except (OSError, ConnectionException) as e:
+                self._worker_progress()
                 self._connected = False
                 self._last_error = str(e)
                 activity_log.record_status_poll("device-poller", "error", str(e))
@@ -361,17 +399,22 @@ class NilanDevice:
                     for _ in range(20):
                         if os.path.exists(PORT_DEV):
                             break
-                        self._stop.wait(0.5)
+                        self._wait_with_progress(0.5)
                 try:
+                    self._worker_progress()
                     self.connect()
+                    self._worker_progress()
                 except Exception as ce:  # noqa: BLE001
+                    self._worker_progress()
                     self._last_error = str(ce)
                     log.warning("Reconnect after poll I/O error failed: %s", ce)
             except Exception as e:  # noqa: BLE001
+                self._worker_progress()
+                self._connected = False
                 self._last_error = str(e)
                 activity_log.record_status_poll("device-poller", "error", str(e))
                 log.warning("Poll failed: %s", e)
-            self._stop.wait(POLL_SECONDS)
+            self._wait_with_progress(POLL_SECONDS)
 
     # -- core device ops (all under lock) --
     def refresh(self) -> dict[str, Any]:
@@ -379,6 +422,12 @@ class NilanDevice:
             if not self._cts:
                 raise RuntimeError("device not connected")
             # frodef's updateData(updateShowData) refreshes self.data from the unit.
+            # scanData seeds its result with self.data.copy(); clear the previous
+            # snapshot first so omitted/unreadable menu values cannot masquerade
+            # as fresh sensor data indefinitely.
+            if not MOCKUP:
+                self._cts.data = {}
+                self._cts.metaData = {}
             try:
                 self._cts.updateData(True)
             except TypeError:
@@ -388,15 +437,52 @@ class NilanDevice:
             if MOCKUP and not getattr(self._cts, "data", None):
                 time.sleep(2.2)
             data = dict(getattr(self._cts, "data", {}) or {})
+            missing = self._missing_required_fields(data)
+            if not MOCKUP and missing:
+                raise RuntimeError("physical poll missing required fields: " + ", ".join(missing))
             self._snapshot = data
             self._last_update_ts = time.time()
+            self._last_update_monotonic = time.monotonic()
             self._connected = True
+            self._connect_failures = 0
         if self._on_state_change:
             try:
                 self._on_state_change(self.status())
             except Exception as e:  # noqa: BLE001
                 log.warning("state callback failed: %s", e)
         return data
+
+    def readiness(self) -> dict[str, Any]:
+        """Describe whether consumers may trust the latest physical snapshot."""
+        now = time.monotonic()
+        age = (now - self._last_update_monotonic
+               if self._last_update_monotonic > 0 else None)
+        missing = self._missing_required_fields(self._snapshot)
+        fresh = age is not None and age <= HEALTH_STALE_SECONDS
+        ready = MOCKUP or (self._connected and fresh and not missing)
+        return {
+            "ready": ready,
+            "mockup": MOCKUP,
+            "connected": self._connected,
+            "physical": not MOCKUP,
+            "age_seconds": round(age, 1) if age is not None else None,
+            "max_age_seconds": HEALTH_STALE_SECONDS,
+            "missing_fields": missing,
+            "last_error": self._last_error,
+        }
+
+    @staticmethod
+    def _missing_required_fields(data: dict[str, Any]) -> list[str]:
+        missing = []
+        for key in (T_ROOM_KEY, T_SUPPLY_KEY, T_EXHAUST_KEY):
+            value = data.get(key)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value)):
+                missing.append(key)
+        status = data.get("status")
+        if not isinstance(status, str) or not status.strip():
+            missing.append("status")
+        return missing
 
     def _retry(self, method: str, *args):
         """Run a device op (by method name) with resilient retries.
@@ -540,6 +626,7 @@ class NilanDevice:
     # -- contract projection (plan section 8) --
     def status(self) -> dict[str, Any]:
         d = self._snapshot
+        freshness = self.readiness()
         status_txt = str(d.get("status", "")).upper()
         # 'off' is inferred when the unit reports an OFF/standby status
         if status_txt in ("OFF", "STANDBY", "STOP", "AUS"):
@@ -570,6 +657,8 @@ class NilanDevice:
             "mockup": MOCKUP,
             "read_only": READ_ONLY,
             "last_update_ts": self._last_update_ts,
+            "sample_age_seconds": freshness["age_seconds"],
+            "telemetry_ready": freshness["ready"],
             "last_error": self._last_error,
         }
 
@@ -677,36 +766,30 @@ mqtt_layer = MqttLayer(device)
 
 
 class LivenessWatchdog:
-    """Restart the process when the device stays `connected:false` too long (TUE-307).
+    """Restart only if the poll/reconnect worker stops making progress.
 
-    The poll loop already self-heals transient bus errors by reconnecting
-    in-process. But a wedged ESP raw-TCP tunnel (the single long-lived client
-    drops and the in-container socat reconnect can't recover) leaves the device
-    stuck disconnected while the HTTP healthcheck stays green and ventilation.*
-    serves stale cached reads. The only proven recovery is a full container
-    restart (fresh socat from entrypoint.sh), so on a *sustained* disconnect we
-    exit the process and let Docker's `restart: unless-stopped` do exactly that.
-
-    Anti-flap: a disconnect must persist continuously for THRESHOLD seconds; any
-    successful reconnect resets the timer, so brief ESP flaps never restart the
-    container. A startup grace gives the initial connect time before the clock
-    starts (and prevents a tight restart loop while the ESP is unreachable).
+    An unreachable device is a degraded but expected condition: the worker must
+    keep retrying and readiness stays false. Restarting just because the bridge
+    is offline caused a container restart loop without improving connectivity.
+    A hung serial/vendor call is different: its heartbeat stops, so a container
+    restart discards that stuck client and recreates the socat tunnel.
     """
 
     def __init__(self, dev: NilanDevice) -> None:
         self._dev = dev
         self._stop = threading.Event()
         self._started_ts = 0.0
-        self._disconnected_since: Optional[float] = None  # None while connected
+        self._degraded_since: Optional[float] = None
+        self._last_tunnel_recovery_request: Optional[float] = None
 
     def start(self) -> None:
         if not WATCHDOG_ENABLED or MOCKUP:
-            log.info("Liveness watchdog disabled (enabled=%s, mockup=%s)", WATCHDOG_ENABLED, MOCKUP)
+            log.info("Worker watchdog disabled (enabled=%s, mockup=%s)", WATCHDOG_ENABLED, MOCKUP)
             return
-        self._started_ts = time.time()
+        self._started_ts = time.monotonic()
         t = threading.Thread(target=self._loop, name="nilan-watchdog", daemon=True)
         t.start()
-        log.info("Liveness watchdog active: restart after connected:false for >%.0fs "
+        log.info("Worker watchdog active: restart only after no poll progress for >%.0fs "
                  "(check=%.0fs, startup_grace=%.0fs)",
                  WATCHDOG_THRESHOLD_SECONDS, WATCHDOG_CHECK_SECONDS, WATCHDOG_STARTUP_GRACE_SECONDS)
 
@@ -714,40 +797,67 @@ class LivenessWatchdog:
         self._stop.set()
 
     def status(self) -> dict[str, Any]:
-        ds = self._disconnected_since
+        now = time.monotonic()
+        ds = self._degraded_since
+        worker_age = max(0.0, now - self._dev._worker_last_progress_monotonic)
         return {
             "enabled": bool(WATCHDOG_ENABLED and not MOCKUP),
             "threshold_seconds": WATCHDOG_THRESHOLD_SECONDS,
-            "disconnected_for_seconds": round(time.time() - ds, 1) if ds else 0.0,
+            "degraded_for_seconds": round(now - ds, 1) if ds is not None else 0.0,
+            "worker_progress_age_seconds": round(worker_age, 1),
+            "worker_stalled": worker_age >= WATCHDOG_THRESHOLD_SECONDS,
         }
 
     def _loop(self) -> None:
         while not self._stop.wait(WATCHDOG_CHECK_SECONDS):
-            now = time.time()
-            if self._dev._connected:
-                self._disconnected_since = None
-                continue
-            # disconnected — hold off until the startup grace has elapsed so the
-            # initial connect (and a fresh post-restart socat) gets a fair chance.
+            now = time.monotonic()
             if now - self._started_ts < WATCHDOG_STARTUP_GRACE_SECONDS:
                 continue
-            if self._disconnected_since is None:
-                self._disconnected_since = now
-                log.warning("Watchdog: device connected:false; arming %.0fs restart timer (last_error=%s)",
-                            WATCHDOG_THRESHOLD_SECONDS, self._dev._last_error)
+            worker_stalled_for = max(0.0, now - self._dev._worker_last_progress_monotonic)
+            if worker_stalled_for >= WATCHDOG_THRESHOLD_SECONDS:
+                self._trigger_restart(worker_stalled_for)
                 continue
-            elapsed = now - self._disconnected_since
-            if elapsed >= WATCHDOG_THRESHOLD_SECONDS:
-                self._trigger_restart(elapsed)
+            state = self._dev.readiness()
+            if state["ready"]:
+                if self._degraded_since is not None:
+                    log.info("Watchdog: physical telemetry recovered after %.0fs",
+                             now - self._degraded_since)
+                self._degraded_since = None
+                self._last_tunnel_recovery_request = None
+                continue
+            if self._degraded_since is None:
+                self._degraded_since = now
+                log.warning("Watchdog: physical telemetry degraded; readiness remains false; worker recovery continues (%s)",
+                            state)
+            degraded_for = now - self._degraded_since
+            cooldown_elapsed = (
+                self._last_tunnel_recovery_request is None
+                or now - self._last_tunnel_recovery_request >= TUNNEL_RECOVERY_COOLDOWN_SECONDS
+            )
+            if degraded_for >= TUNNEL_RECOVERY_THRESHOLD_SECONDS and cooldown_elapsed:
+                try:
+                    fd = os.open(TUNNEL_RECOVERY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                except FileExistsError:
+                    # A request already awaits consumption. Start the cooldown
+                    # so a slow tunnel transition cannot spam/rewrite the marker.
+                    self._last_tunnel_recovery_request = now
+                except OSError:
+                    log.exception("Watchdog could not request tunnel recovery")
+                    self._last_tunnel_recovery_request = now
+                else:
+                    os.close(fd)
+                    self._last_tunnel_recovery_request = now
+                    log.warning("Watchdog requested a single-owner tunnel reconnect after %.0fs degraded telemetry",
+                                degraded_for)
 
     def _trigger_restart(self, elapsed: float) -> None:
-        log.error("Watchdog: device connected:false for %.0fs (>%.0fs threshold) — "
+        log.error("Watchdog: poll worker made no progress for %.0fs (>%.0fs threshold) — "
                   "exiting for container restart (fresh socat tunnel). last_error=%s",
                   elapsed, WATCHDOG_THRESHOLD_SECONDS, self._dev._last_error)
         try:
             activity_log.record_status_poll(
                 "watchdog", "error",
-                f"sustained disconnect {elapsed:.0f}s -> container restart")
+                f"poll worker stalled {elapsed:.0f}s -> container restart")
         except Exception:  # noqa: BLE001
             pass
         # flush stdio so the reason survives the abrupt exit, then hard-exit.
@@ -845,8 +955,19 @@ class RoomBody(BaseModel):
 
 @app.get("/healthz")
 def healthz():
+    """Process liveness only. Docker restart decisions use /readyz separately."""
     return {"ok": True, "connected": device._connected, "mockup": MOCKUP,
+            "telemetry_ready": device.readiness()["ready"],
             "read_only": READ_ONLY, "watchdog": watchdog.status()}
+
+
+@app.get("/readyz")
+def readyz():
+    """Physical readiness: only a recent, complete unit poll counts as ready."""
+    state = device.readiness()
+    if not state["ready"]:
+        return JSONResponse(status_code=503, content=state)
+    return state
 
 
 @app.get("/api/meta")

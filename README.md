@@ -40,6 +40,12 @@ the socat/broker/proxy layers here are reused as-is.
 
 ## Operator Documentation
 
+- [`firmware/reliable/README.md`](firmware/reliable/README.md) describes the
+  maintained dual Wi-Fi/USB bridge, persistent network settings, authenticated
+  recovery access, transport arbitration, build and rollout checks.
+- [`ops/usb-proxy/README.md`](ops/usb-proxy/README.md) packages the optional USB
+  fallback as a restricted system service with stable device naming and bounded
+  recovery. USB still requires an always-on attached host.
 - [`docs/architecture-setup-debugging.md`](docs/architecture-setup-debugging.md)
   is the canonical restart point for architecture, host split, live addresses,
   setup commands, safety gates, API/MQTT surfaces, physical bring-up, rollback,

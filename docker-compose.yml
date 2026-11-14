@@ -36,7 +36,9 @@ services:
     depends_on: [mosquitto]
     networks: [nilan]
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,json,sys; d=json.loads(urllib.request.urlopen('http://127.0.0.1:8642/healthz').read()); sys.exit(0 if d.get('connected') or d.get('mockup') else 1)"]
+      # Readiness requires a complete recent physical poll in real mode. /healthz
+      # remains process liveness and can stay green through a bridge outage.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8642/readyz', timeout=4)"]
       interval: 30s
       timeout: 5s
       retries: 3

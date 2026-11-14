@@ -16,6 +16,8 @@ COPY app/manifest.webmanifest /app/manifest.webmanifest
 COPY app/sw.js /app/sw.js
 COPY app/icons /app/icons
 COPY app/entrypoint.sh /app/entrypoint.sh
+COPY app/tunnel_supervisor.py /app/tunnel_supervisor.py
+COPY app/process_supervisor.py /app/process_supervisor.py
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 8642
