@@ -96,21 +96,75 @@ hardware-validation change, not an unreviewed dependency update.
 3. `pio run`. Native policy checks:
    `g++ -std=c++17 -I include tests/policy_test.cpp -o /private/path/policy-test`
    and run that executable.
-4. First migration must flash the matching bootloader, partition table and app
-   from the new build. Do not upload only the app into an unknown old partition
-   layout. Back up the current full flash and NVS first. Never use `erase-flash`.
-5. Stop/release the USB proxy before flashing. Native CDC bootloader entry uses
-   a 1200-baud open/close, then esptool `--before usb-reset`; the USB port may
-   disappear immediately, producing harmless EIO. Use a stable by-id path once
-   the firmware has re-enumerated. Restart the sole server transport afterward.
-6. Verify fresh complete physical samples and `/readyz`, unchanged control
-   settings, continued room-source feed and actual T15 readback. Test proxy
+4. These examples name the pinned esptool 4.5.1 and 5.6.0 executables
+   `esptool-4.5.1` and `esptool-5.6.0`; substitute the paths to those isolated
+   installs. Stop/release the USB proxy before flashing. Enter the native USB/JTAG ROM
+   downloader by opening the running CDC serial device at 115200 baud, changing
+   it to 1200 baud, then closing it. The device disconnects and re-enumerates as
+   the ROM USB/JTAG downloader; refresh the device path after re-enumeration.
+   Following this 1200-baud touch, use esptool's `--before no-reset`. **Do not
+   use `--before usb-reset`** here: it resets the chip out of the ROM downloader
+   before esptool can connect. The 1200-baud setting may report an immediate
+   USB I/O error as the product changes; confirm the ROM device appeared
+   instead of repeatedly trying reset modes.
+
+5. Before touching flash, preserve the NVS partition. In this layout it is
+   `0x9000` through `0xdfff` (`0x5000` bytes); it contains the saved Wi-Fi
+   credentials. Store the backup with mode `0600` outside Git and verify its
+   size and checksum. A full-flash backup is useful too, but reading all 16 MiB
+   over USB can take a long time; reuse a verified existing full backup when
+   available. **Never run `erase-flash` or write a merged `factory.bin` at
+   offset zero**: the merged image spans the NVS offset and overwrites saved
+   credentials.
+
+   Set `PORT` to the ROM downloader's current serial device path:
+
+   ```bash
+   umask 077
+   esptool-4.5.1 --chip esp32s3 --port "$PORT" read-flash 0x9000 0x5000 "$PRIVATE_DIR/nilan-nvs-before.bin"
+   chmod 600 "$PRIVATE_DIR/nilan-nvs-before.bin"
+   sha256sum "$PRIVATE_DIR/nilan-nvs-before.bin"
+   ```
+
+6. For a first migration, write the matching segments individually. Use the
+   exact bootloader, partition table and `boot_app0.bin` from the pinned build
+   environment; the application image is `firmware.bin`:
+
+   ```bash
+   esptool-4.5.1 --chip esp32s3 --port "$PORT" --before no-reset write-flash \
+     0x0000 "$BUILD_DIR/bootloader.bin" \
+     0x8000 "$BUILD_DIR/partitions.bin" \
+     0xe000 "$BOOT_APP0_BIN" \
+     0x10000 "$BUILD_DIR/firmware.bin"
+   ```
+
+   This preserves the NVS partition. Routine application updates through the
+   authenticated `/update` page upload only the application `.bin`; they do
+   not rewrite the bootloader, partition table, or NVS.
+
+7. The segmented write above was verified with esptool 4.5.1. After writing,
+   esptool 4.5.1 left the chip in the ROM/stub state. The tested way to confirm
+   the new app boots is esptool 5.6.0's non-writing `flash-id` command, which
+   connects without another reset and then uses a watchdog reset:
+
+   ```bash
+   esptool-5.6.0 --chip esp32s3 --port "$PORT" --before no-reset --after watchdog-reset flash-id
+   ```
+
+   This verified the ROM-to-app exit path; segmented writes with esptool 5.6.0
+   have not been separately verified. Keep the known-good USB image and full
+   pre-change flash backup for recovery. A successful write does not guarantee
+   automatic rollback if the new app later fails.
+
+8. After the new app has booted, restart the sole server transport. Verify fresh
+   complete physical samples and `/readyz`, unchanged control settings,
+   continued room-source feed and actual T15 readback. Test proxy
    reconnect and software reboot recovery, then bad-password fallback, network
    loss/rejoin, exclusive transport ownership, authenticated/unauthenticated
    status and interrupted OTA. Do not claim those live checks passed from build
    or unit tests alone. A live rollout interrupts the ventilation control link;
    obtain the required production approval first.
-7. Keep a verified DHCP reservation or configure a deliberately managed endpoint.
+9. Keep a verified DHCP reservation or configure a deliberately managed endpoint.
    Do not invent a new static bridge address or rely on historical .15/.30 notes.
    Remove the USB proxy alias before assigning that same address to the ESP.
 
