@@ -259,11 +259,13 @@ with bounded connect and increasing backoff. Keep the fallback endpoint on the
 private home network and do not expose TCP/6638 publicly.
 
 If the API keeps running but physical polls remain invalid or absent for
-`NILAN_TUNNEL_RECOVERY_THRESHOLD_SECONDS` (default 180), it writes a private
+`NILAN_TUNNEL_RECOVERY_THRESHOLD_SECONDS` (default 60), it writes a private
 atomic marker at `NILAN_TUNNEL_RECOVERY_FILE`. The supervisor closes the current
 `socat` session before advancing to the next configured endpoint. A 180 second
 cooldown prevents repeated rotations during a sustained outage; any fresh
-physical poll resets the recovery timer. The process coordinator separately
+physical poll resets the recovery timer. The 60 second trigger leaves room for
+the 15 second watchdog check cadence while keeping silent-protocol recovery
+inside the 90 second physical-readiness stale window. The process coordinator separately
 restarts the container if either the API or tunnel supervisor exits unexpectedly.
 
 Writes use the same device lock as the poller and MQTT commands. A protocol

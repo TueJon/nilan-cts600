@@ -2,7 +2,7 @@ import threading
 
 import pytest
 
-from tunnel_supervisor import Endpoint, endpoints_from_env, run_cycle, supervise
+from tunnel_supervisor import Endpoint, endpoints_from_env, run_cycle, socat_command, supervise
 
 
 def test_endpoints_from_env_keeps_primary_before_optional_usb_fallback():
@@ -19,6 +19,15 @@ def test_endpoint_config_fails_closed_without_primary_and_deduplicates_fallback(
     assert endpoints_from_env({
         "ESP_IP": "192.0.2.30", "ESP_FALLBACK_IP": "192.0.2.30",
     }) == [Endpoint("192.0.2.30", 6638)]
+
+
+def test_socat_tcp_failure_detection_uses_short_keepalive_and_user_timeout():
+    command = socat_command(Endpoint("192.0.2.30", 6638), "/dev/ttyNILAN")
+    assert command[0] == "socat"
+    assert command[-1] == (
+        "tcp:192.0.2.30:6638,connect-timeout=5,keepalive,"
+        "keepidle=15,keepintvl=5,keepcnt=3,setsockopt-int=6:18:15000"
+    )
 
 
 def test_fallback_is_opened_only_after_primary_stream_closes():

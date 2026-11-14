@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 log = logging.getLogger("nilan-tunnel")
 RECOVERY_FILE = os.environ.get("NILAN_TUNNEL_RECOVERY_FILE", "/run/nilan-tunnel-recover")
+# TCP_USER_TIMEOUT is Linux TCP option 18 at IPPROTO_TCP level 6 (milliseconds).
+TCP_USER_TIMEOUT_MS = 15_000
 
 
 @dataclass(frozen=True)
@@ -67,16 +69,23 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
         proc.wait()
 
 
+def socat_command(endpoint: Endpoint, tty: str) -> list[str]:
+    """Build a tunnel with bounded TCP failure detection (Linux container)."""
+    return [
+        "socat", "-d", f"pty,link={tty},raw,echo=0,mode=666",
+        f"tcp:{endpoint.host}:{endpoint.port},connect-timeout=5,keepalive,"
+        f"keepidle=15,keepintvl=5,keepcnt=3,"
+        f"setsockopt-int=6:18:{TCP_USER_TIMEOUT_MS}",
+    ]
+
+
 def run_socat(
     endpoint: Endpoint, tty: str, stop: threading.Event,
     recovery_file: str = RECOVERY_FILE,
     recovery_requested: threading.Event | None = None,
 ) -> float:
     """Own exactly one serial tunnel until it closes or shutdown is requested."""
-    command = [
-        "socat", "-d", f"pty,link={tty},raw,echo=0,mode=666",
-        f"tcp:{endpoint.host}:{endpoint.port},connect-timeout=5,keepalive,keepidle=60,keepintvl=10,keepcnt=5",
-    ]
+    command = socat_command(endpoint, tty)
     started = time.monotonic()
     proc = subprocess.Popen(command, start_new_session=True)
     try:
