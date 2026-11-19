@@ -1,0 +1,11 @@
+:8643 {
+	basic_auth {
+		nilan <PASSWORD_HASH>
+	}
+	reverse_proxy nilan-api:8642
+	encode gzip
+	log {
+		output stdout
+		level INFO
+	}
+}

@@ -1,12 +1,12 @@
 """
 Nilan CTS600 — thin REST + MQTT wrapper around frodef's CTS600 protocol library.
 
-Server-side "brain" for TUE-22 / TUE-16. The ESP32 is only a transparent
+Server-side service for the CTS600. The ESP32 is only a transparent
 RAW serial<->TCP tunnel; the CTS600 custom protocol is driven here by
 frodef's `nilan_cts600.CTS600` over a serial device (`/dev/ttyNILAN`, created
 by socat from the ESP TCP stream).
 
-Implements the API/MQTT contract from TUE-16 plan section 8:
+Implements the API/MQTT contract for the CTS600:
 
   GET  /api/status -> { t_room, t_supply, t_exhaust, fan_level, mode, ... }
   POST /api/fan    <- { "level": 0-4 }          (0 = off)
@@ -79,7 +79,7 @@ HTTP_PORT = int(os.environ.get("NILAN_HTTP_PORT", "8642"))
 ESP_IP = os.environ.get("ESP_IP", "").strip()       # live ESP bridge IP (real mode)
 ESP_PORT = os.environ.get("ESP_PORT", "6638").strip()
 
-# Worker watchdog (TUE-307). The API remains alive and reports `/readyz` as
+# Worker watchdog. The API remains alive and reports `/readyz` as
 # degraded while the bridge is unreachable. Container restart is reserved for
 # a truly stalled poll/reconnect worker, not normal offline retry cycles.
 WATCHDOG_ENABLED = os.environ.get("NILAN_WATCHDOG_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -99,7 +99,7 @@ TUNNEL_RECOVERY_COOLDOWN_SECONDS = float(
 # match (temperatures). Empty string disables. Default ENGLISH.
 SET_LANGUAGE = os.environ.get("NILAN_SET_LANGUAGE", "ENGLISH").strip()
 
-APP_VERSION = "1.2"  # 1.2 adds activity log (TUE-78)
+APP_VERSION = "1.2"  # 1.2 adds activity log
 DASHBOARD_HTML = (Path(__file__).resolve().parent / "dashboard.html")
 MANIFEST_FILE = (Path(__file__).resolve().parent / "manifest.webmanifest")
 SERVICE_WORKER_FILE = (Path(__file__).resolve().parent / "sw.js")
@@ -112,7 +112,7 @@ MQTT_PASS = os.environ.get("MQTT_PASS", "").strip()
 MQTT_BASE = os.environ.get("MQTT_BASE_TOPIC", "nilan").strip().rstrip("/")
 
 # Sensor->contract mapping. PROVISIONAL: exact supply/exhaust sensor ids are
-# confirmed against the real unit's nameplate (TUE-16 plan section 11). Override
+# confirmed against the real unit's nameplate. Override
 # via env without code changes once the live register dump is available.
 T_ROOM_KEY = os.environ.get("NILAN_T_ROOM_KEY", "T15")
 T_SUPPLY_KEY = os.environ.get("NILAN_T_SUPPLY_KEY", "T1")
@@ -1011,7 +1011,7 @@ def get_meta(_: None = Depends(auth)):
             "status": "Status",
             "display": "Display-Text",
             # Sensor labels confirmed live from the unit's "ANZEIGE DATEN" menu
-            # (TUE-55): RAUM=T15, ZULUFT=T2, FRISCHL.=T1, KONDENS.=T5, VERDAMP.=T6.
+            #: RAUM=T15, ZULUFT=T2, FRISCHL.=T1, KONDENS.=T5, VERDAMP.=T6.
             "T15": "Raum (T15)", "T2": "Zuluft (T2)", "T1": "Frischluft/Außen (T1)",
             "T5": "Kondensator (T5)", "T6": "Verdampfer (T6)",
             "ZULUFT_STUFE": "Zuluft-Stufe", "ABLUFT_STUFE": "Abluft-Stufe",
@@ -1027,7 +1027,7 @@ def get_meta(_: None = Depends(auth)):
             "humidity": "%", "RH": "%",
         },
         # Plain-language meaning of each parameter, from the Nilan CTS600 manual +
-        # frodef's reverse-engineering (TUE-55). Lets the UI explain values inline.
+        # frodef's reverse-engineering. Lets the UI explain values inline.
         "descriptions": {
             "T1": "Frischluft/Außentemperatur — angesaugte Außenluft (Fühler an der Nordseite).",
             "T2": "Zulufttemperatur am Ventilator, vor einem evtl. Nachheizregister (heißt T7 mit Heizregister).",
@@ -1073,7 +1073,7 @@ def get_activity(
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
-    """Read-only web dashboard (TUE-55 Phase 1). Served same-origin so it lives
+    """Read-only web dashboard. Served same-origin so it lives
     behind the same Caddy auth as the API."""
     try:
         return HTMLResponse(DASHBOARD_HTML.read_text(encoding="utf-8"), headers={"Cache-Control": "no-store"})

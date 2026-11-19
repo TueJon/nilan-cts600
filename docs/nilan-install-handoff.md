@@ -1,6 +1,6 @@
-# Nilan CTS600 install handoff — user steps + agent/Paperclip delegation
+# Nilan CTS600 install handoff
 
-This is the practical install guide for TUE-16/TUE-20 after the ESP32 bridge was flashed.
+Follow these steps after flashing the ESP32 bridge.
 
 ## Current state
 
@@ -16,7 +16,7 @@ filesystem paths in a private operator runbook.
 - Server safety: keep `NILAN_READ_ONLY=1`, so REST writes return `403` and MQTT command topics are ignored during first live bringup.
 - Start in mock mode with `NILAN_MOCKUP=1`. Switch to real mode only after RS485 wiring is done.
 
-## 2026-06-19 — Live bringup diagnosis (Wattson)
+## 2026-06-19 — Live bringup diagnosis
 
 **Historical record, superseded UART setting:** the later live-verified ESP UART
 setting is **19200 8N1** (`parity: NONE`, `stop_bits: 1`). Older cores tolerated
@@ -43,9 +43,6 @@ same local network.
 
 ## Reference links
 
-- Paperclip parent issue: `TUE-16` (private tracker)
-- Paperclip implementation issue: `TUE-20` (private tracker)
-- Paperclip server issue: `TUE-22` (private tracker)
 - ESP web UI: `http://<bridge-ip>/`
 - Waveshare board docs: `https://www.waveshare.net/wiki/ESP32-S3-RS485-CAN`
 - ESPHome stream server component: `https://github.com/oxan/esphome-stream-server`
@@ -63,7 +60,7 @@ Hard rules:
 4. Do not connect the original CTS600 panel and the ESP as two masters at the same time.
 5. First live test is read-only: no fan/mode/temp writes until real status polling is stable.
 
-## What Jonas physically does
+## On-site installation
 
 ### Step 1 — Prepare
 
@@ -79,7 +76,7 @@ Before touching wires:
 
 1. Open `http://<bridge-ip>/` on the same network and confirm the ESP UI loads.
 2. Take a photo of the Nilan panel/connector before disconnecting anything.
-3. Send/post the photo to TUE-16 if anything differs from `12V / A / /B / GND`.
+3. Share the photo with the installer if anything differs from `12V / A / /B / GND`.
 
 ### Step 2 — Power down
 
@@ -122,7 +119,7 @@ If reads fail later, possible fixes are swapping `A`/`B`, adding shared `GND`, o
 Ask an agent:
 
 ```text
-TUE-16 Nilan is wired and powered. On <deployment-host>, switch <repo-dir> from NILAN_MOCKUP=1 to NILAN_MOCKUP=0, keep NILAN_READ_ONLY=1, set ESP_IP=<bridge-ip> and ESP_PORT=6638. Recreate nilan-api, watch logs, and verify only read-only /api/status + MQTT state. Do not send write commands.
+Nilan is wired and powered. On <deployment-host>, switch <repo-dir> from NILAN_MOCKUP=1 to NILAN_MOCKUP=0, keep NILAN_READ_ONLY=1, set ESP_IP=<bridge-ip> and ESP_PORT=6638. Recreate nilan-api, watch logs, and verify only read-only /api/status + MQTT state. Do not send write commands.
 ```
 
 Expected agent commands on `<deployment-host>`:
@@ -149,7 +146,7 @@ Acceptance criteria:
 Use this prompt if `/api/status` is not connected:
 
 ```text
-TUE-16 real read-only bringup failed. Diagnose without writes. Check nilan-api logs, socat connection, ESP bridge reachability, and likely RS485 A/B polarity. Do not disable NILAN_READ_ONLY and do not send fan/mode/temp commands.
+Read-only bringup failed. Diagnose without writes. Check nilan-api logs, socat connection, ESP bridge reachability, and likely RS485 A/B polarity. Do not disable NILAN_READ_ONLY and do not send fan/mode/temp commands.
 ```
 
 Likely outcomes:
@@ -164,7 +161,7 @@ Likely outcomes:
 Only after real status is stable for several minutes:
 
 ```text
-TUE-16 read-only status is stable. Prepare a controlled write test plan but do not execute without confirmation. Keep changes minimal: fan 1->2->1, then setpoint readback. Explain rollback.
+Read-only status is stable. Prepare a controlled write test plan but do not execute without confirmation. Keep changes minimal: fan 1->2->1, then setpoint readback. Explain rollback.
 ```
 
 Before any write:
@@ -178,7 +175,7 @@ Then an agent may temporarily set `NILAN_READ_ONLY=0` and run exactly one small 
 
 ## What to post back to Paperclip
 
-After each phase, post a TUE-16 comment with:
+After each phase, record:
 
 - Physical wiring state.
 - Whether original panel is disconnected.

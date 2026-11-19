@@ -514,7 +514,7 @@ class CTS600:
         if updateShowData:
             show_data = [
                 # Menu label is language-dependent: EN "SHOW DATA", DE "ANZEIGE DATEN".
-                # (TWB/TUE-55: this unit's panel is German.)
+                # (Some panels use German.)
                 f (display=Key.UP, regexp="(SHOW/DATA|ANZEIGE/DATEN)", gonext=self.key_enter),
                 [ (Key.DOWN, ""),
                   f (regexp=r"STATUS/(?P<value>.*)", var='status'),
@@ -618,7 +618,7 @@ class CTS600:
         self.key_enter() # thermostat
         self.key_enter() # heat/cool mode
         # Confirm we reached the flow-input field. frodef expects the blink text
-        # to be exactly '>{flow}<', but some panels (TUE-55: this DE CTS600)
+        # to be exactly '>{flow}<', but some panels (including German CTS600 panels)
         # blink only the digit -> '>{3}<' yields blink text '3'. Accept as long
         # as the current flow digit is the blinking value.
         blink = getBlinkText (self.key_enter())

@@ -29,10 +29,10 @@ wifi:
   power_save_mode: none
   # Preserve fallback access during an AP outage; no whole-device reboot loop.
   reboot_timeout: 0s
-  # Static IP is recommended because tj-lt socat connects to this endpoint.
+  # Static IP is recommended because socat connects to this endpoint.
   # manual_ip:
-  #   static_ip: 192.168.1.50
-  #   gateway: 192.168.1.1
+  #   static_ip: 192.0.2.50
+  #   gateway: 192.0.2.1
   #   subnet: 255.255.255.0
   ap:
     ssid: "Nilan-Bridge Setup"

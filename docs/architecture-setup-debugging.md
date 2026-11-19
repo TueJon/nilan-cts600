@@ -27,7 +27,8 @@ secret-bearing files are:
 
 - `env/nilan.env`: runtime mode, MQTT password, optional API token, ESP target.
 - `mosquitto/passwd`: hashed MQTT users for Mosquitto.
-- `caddy/Caddyfile`: Caddy basic-auth hash only; never add plaintext.
+- For the optional `legacy-ui` profile, copy `caddy/Caddyfile.example` to the ignored
+  `caddy/Caddyfile.local` and replace `<PASSWORD_HASH>` with a locally generated Caddy hash.
 - `firmware/secrets.yaml`: ESPHome Wi-Fi/API/OTA/AP secrets, if firmware is
   built from this checkout.
 
@@ -43,7 +44,7 @@ secret-bearing files are:
 | `docker-compose.yml` | Live core stack: `mosquitto`, `nilan-api`; retired `caddy` is under the explicit `legacy-ui` profile. |
 | `env/nilan.env.example` | Safe template for local runtime config. |
 | `mosquitto/mosquitto.conf` | Authenticated local Mosquitto config. |
-| `caddy/Caddyfile` | Reverse proxy and basic-auth hash for web/API access. |
+| `caddy/Caddyfile.example` | Template for the optional loopback reverse proxy. |
 | `systemd/socat-nilan.service` | Optional host-side `socat`; not required for the compose deployment. |
 | `docs/nilan-install-handoff.md` | Physical install and bring-up handoff. |
 
