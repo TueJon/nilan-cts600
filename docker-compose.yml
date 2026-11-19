@@ -1,4 +1,4 @@
-# Nilan CTS600 server-side stack (TUE-22).
+# Nilan CTS600 server-side stack.
 # The API and broker bind to the internal compose network. The old Caddy UI is
 # retired and profile-gated; default `docker compose up` must never publish it.
 #
@@ -51,7 +51,12 @@ services:
     restart: unless-stopped
     mem_limit: 96m
     volumes:
-      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - type: bind
+        source: ./caddy/Caddyfile.local
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind:
+          create_host_path: false
       - caddy-data:/data
       - caddy-config:/config
     ports:

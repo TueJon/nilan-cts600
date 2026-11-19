@@ -1,9 +1,9 @@
-# Nilan CTS600 — Server Stack (TUE-22)
+# Nilan CTS600 — Server Stack
 
-Server-side "brain" for the Nilan CTS600 WLAN control (parent: TUE-16). The
+Server-side "brain" for the Nilan CTS600 WLAN control. The
 ESP32 is only a transparent **raw serial↔TCP tunnel**; the CTS600 custom
 protocol is driven here by **frodef**'s `CTS600` class over a serial device,
-and exposed as the REST + MQTT contract from TUE-16 plan §8.
+and exposed as a REST and MQTT interface.
 
 ```
 Nilan ── RS485 ──> ESP32 (raw TCP :6638) ──WLAN──> [ socat ─> /dev/ttyNILAN ─> frodef ] ─> REST + MQTT
@@ -34,7 +34,7 @@ the socat/broker/proxy layers here are reused as-is.
 | `app/Dockerfile`, `app/entrypoint.sh` | API image; entrypoint runs socat sidecar in real mode |
 | `docker-compose.yml` | `mosquitto` + `nilan-api`; retired Caddy fallback is profile-gated |
 | `mosquitto/` | broker config + `passwd` (gitignored) |
-| `caddy/Caddyfile` | reverse proxy + basic auth on `:8643` |
+| `caddy/Caddyfile.example` | optional local reverse proxy template |
 | `env/nilan.env(.example)` | config + secrets (`.env` gitignored) |
 | `systemd/socat-nilan.service` | OPTIONAL host-side socat (only for a host consumer; container has its own) |
 
@@ -70,7 +70,7 @@ docker compose exec -T nilan-api curl -s http://127.0.0.1:8642/api/status | jq
 
 ## Go live (ESP bridge installed)
 
-When Wattson reports the live/static ESP IP on TUE-16:
+Once you know the bridge’s static IP:
 
 ```bash
 cd <repo-dir>
@@ -83,7 +83,7 @@ docker compose exec -T nilan-api curl -s http://127.0.0.1:8642/api/status | jq
 
 Then run the §9 control verification (fan 1→2→3, mode, setpoint set+readback) and
 confirm the provisional `NILAN_T_SUPPLY_KEY`/`NILAN_T_EXHAUST_KEY` mapping against
-the unit's register dump (TUE-16 §11).
+the unit's register dump.
 
 ## Dashboard and legacy Caddy rollback
 
